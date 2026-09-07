@@ -1,0 +1,4 @@
+.build/
+Kura.app
+dist/
+.DS_Store
