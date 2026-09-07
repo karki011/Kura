@@ -25,6 +25,27 @@ protocol LLMProvider: Sendable {
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error>
 }
 
+/// Security may wait for a macOS access prompt. Never do that on the UI thread.
+struct KeychainBackedProvider: LLMProvider {
+    let account: String
+    let factory: @Sendable (String) -> any LLMProvider
+    func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let key = await Task.detached { Keychain.get(account: account, allowInteraction: true) ?? "" }.value
+                    try Task.checkCancellation()
+                    for try await text in factory(key).stream(messages: messages, system: system) {
+                        try Task.checkCancellation(); continuation.yield(text)
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 // MARK: - Shared SSE helper
 
 struct SSEStream {
@@ -97,6 +118,19 @@ struct JSONLineStream {
 struct AnthropicProvider: LLMProvider {
     let apiKey: String
     let model: String
+    var effort = "default"
+    var adaptiveThinking = false
+    var tokenLimit = 4096
+
+    func requestBody(messages: [LLMMessage], system: String) -> [String: Any] {
+        var body: [String: Any] = ["model": model, "max_tokens": tokenLimit, "stream": true, "system": system,
+                                   "messages": messages.map { ["role": $0.role, "content": $0.content] }]
+        if effort != "default" {
+            body["output_config"] = ["effort": effort]
+            if adaptiveThinking { body["thinking"] = ["type": "adaptive"] }
+        }
+        return body
+    }
 
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
@@ -108,15 +142,14 @@ struct AnthropicProvider: LLMProvider {
                     request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
                     request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
                     request.setValue("application/json", forHTTPHeaderField: "content-type")
-                    request.httpBody = try JSONSerialization.data(withJSONObject: [
-                        "model": model,
-                        "max_tokens": 2048,
-                        "stream": true,
-                        "system": system,
-                        "messages": messages.map { ["role": $0.role, "content": $0.content] },
-                    ])
+                    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(messages: messages, system: system))
                     for try await payload in SSEStream.payloads(for: request) {
                         guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
+                        if obj["type"] as? String == "error" { throw LLMError.http(200, String(data: payload, encoding: .utf8) ?? "Streaming error") }
+                        if obj["type"] as? String == "message_delta",
+                           (obj["delta"] as? [String: Any])?["stop_reason"] as? String == "max_tokens" {
+                            throw KuraError.message("Claude reached the output/reasoning budget. Lower effort or increase the token budget in Settings.")
+                        }
                         guard obj["type"] as? String == "content_block_delta",
                               let delta = obj["delta"] as? [String: Any],
                               delta["type"] as? String == "text_delta",
@@ -164,11 +197,13 @@ struct OpenAICompatibleProvider: LLMProvider {
                     // time-to-first-token 5-30x, so force minimal effort and cap output length.
                     if model.hasPrefix("gpt-5") || model.hasPrefix("gpt-6") || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
                         body["reasoning_effort"] = effort
-                        body["max_completion_tokens"] = 900
+                        body["max_completion_tokens"] = 4096
                     }
                     request.httpBody = try JSONSerialization.data(withJSONObject: body)
                     for try await payload in SSEStream.payloads(for: request) {
-                        guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                        guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
+                        if obj["error"] != nil { throw LLMError.http(200, String(data: payload, encoding: .utf8) ?? "Streaming error") }
+                        guard
                               let choices = obj["choices"] as? [[String: Any]],
                               let delta = choices.first?["delta"] as? [String: Any],
                               let text = delta["content"] as? String else { continue }
@@ -216,7 +251,9 @@ struct OllamaProvider: LLMProvider {
                             + messages.map { ["role": $0.role, "content": $0.content] },
                     ])
                     for try await payload in JSONLineStream.payloads(for: request) {
-                        guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                        guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
+                        if let error = obj["error"] as? String { throw LLMError.http(200, error) }
+                        guard
                               let message = obj["message"] as? [String: Any],
                               let text = message["content"] as? String,
                               !text.isEmpty else { continue }

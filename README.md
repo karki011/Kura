@@ -34,7 +34,7 @@ Bring your own Anthropic or OpenAI-compatible API key—or run a model locally w
 
 ### Designed to stay out of your way
 
-- Native, movable, translucent macOS panel with light, dark, and adaptive themes
+- Native, movable, translucent macOS workspace with light, dark, and system appearance
 - Keyboard-first controls, including hold-to-talk
 - Streaming answers with Markdown, code blocks, and checklists
 - An accessory-style app experience with no call participant or meeting bot
@@ -60,9 +60,38 @@ On first launch, macOS will guide you through the permissions Kura needs:
 
 - **Microphone** and **Speech Recognition** for push-to-talk input
 - **Accessibility** for global shortcuts
-- **Screen Recording** is optional and only supports the adaptive overlay theme
+- **Screen Recording** is optional and supports observation of your selected meeting window
 
 Open settings with `⌃⌥,`, add your provider key, choose a model, and start a session.
+
+You can open the workspace and type without granting audio permissions; Kura requests those when you use audio features. The menu-bar icon brings Kura back whenever you need it.
+
+### A clearer meeting workflow
+
+1. **Prepare:** name the meeting, set a goal, and choose a Planning, Customer Call, or Brainstorm template. Use **Add context** for notes, pasted text, and multiple PDF/text attachments. Drop files onto the workspace to attach them. Each attachment has a preview and removal control; extraction and AI context limits are shown explicitly.
+2. **Listen:** use **Listen** to capture system audio. Under **More → Meeting capture**, optionally include your microphone as **You**. Use a headset to reduce duplicated audio. **Catch me up**, **Suggest a response**, and **Capture decision** keep assistance close to the transcript. Visible Send and Stop controls preserve unsent text while an answer runs.
+3. **Wrap up:** generate editable Summary, Decisions, Action Items, and Open Questions. Tasks have owners, deadlines, completion states, and supporting transcript links when the model supplies valid references. Generate an editable follow-up draft and copy it when ready.
+4. **Revisit:** search meeting titles, notes, tags, and transcripts. Rename or favorite meetings, ask questions using a saved meeting’s context, and export that selected meeting to Markdown. Deletion moves files to Kura’s local Trash, with an Undo action.
+
+Live sessions autosave locally and restore after relaunch. Full transcripts are retained; long wrap-ups process the transcript in sections instead of only using the final few minutes. Meeting history is also saved when wrapping up or starting another session. The overlay remembers its position and offers a compact view. Auto appearance follows macOS without background screen sampling.
+
+### Speaker labels and meeting windows
+
+Apple transcription is the default and does **not** separate individual remote speakers. They appear as **Unknown speaker**. Optional continuous microphone capture labels your voice **You**.
+
+For free local transcription **and** speaker separation, choose **Local · Whisper + pyannote** in Settings → Audio. Select your whisper-cli executable, Whisper model, Python environment, and downloaded Community-1 model folder. [Setup instructions](Sources/Kura/Resources/LOCAL_SPEECH_SETUP.md) explain installation and the model’s access conditions. Kura does not include or automatically download these weights. Deepgram has been removed.
+
+Local audio uses rolling 30-second windows submitted every 10 seconds; text and speaker labels appear after processing, not word by word. Overlapping speech windows help preserve labels, but returning speakers after long pauses may receive a new label. Names still need confirmation. Temporary audio is deleted after processing or normal stop; a crash can leave temporary files. The local worker disables Hugging Face online access and telemetry. Optional microphone inclusion remains a separate Apple recognition path.
+
+**Listen** updates the transcript. Turn on **Auto answer** to answer detected finalized remote questions using your selected AI provider, or ask a typed question. Disabling Auto answer leaves transcription running without automatic AI requests.
+
+For optional name suggestions, choose **More → Meeting capture → Refresh**, select your Zoom, Google Meet, Teams, or other meeting window, then choose **Observe selected window**. Screen Recording permission is required. Kura uses Apple Vision locally to read visible text; screenshots are not stored or sent to an AI provider. Turn on meeting captions to improve matching. Explicit speaking labels and matching caption text can suggest a name, but Kura does not infer names from faces or automatically assign identities. Click a speaker label to confirm/correct a name and optionally rename that speaker throughout the session.
+
+Window layouts, hidden captions, overlapping speech, and recognition quality affect results. This is not a native Zoom/Meet participant integration. System audio may include other apps. Preview testing uses synthetic data; real multi-speaker calls still need validation with your setup.
+
+### Reusable context
+
+Save notes, a goal, and attachments as a named **context pack** inside Add context. Apply a pack explicitly to another meeting; context is never silently carried into a new session. PDF extraction supports selectable text, not scanned-image OCR. Imports allow up to 20 MB per file and retain up to 30,000 characters per attachment; the AI background budget is 40,000 characters across goal, notes, and attachments, with an in-app warning when exceeded.
 
 ### Use a local model with Ollama
 
@@ -74,6 +103,10 @@ Open settings with `⌃⌥,`, add your provider key, choose a model, and start a
 Ollama traffic stays between Kura and the server address you configure. You can still use the OpenAI-compatible provider for other local runtimes that expose that API, such as LM Studio.
 
 ### Connect a custom OpenAI-compatible provider
+
+For **Anthropic/Claude** or **OpenAI**, choose its dedicated provider in Settings → AI setup, save your own key, and choose **Refresh available models**. The searchable catalog lists all models returned for that key, with manual model-ID entry as a fallback. Claude reasoning options come from model capabilities. OpenAI’s catalog does not report per-model effort support, so its effort selector shows API options with a model-compatibility warning; **Provider default** omits the parameter. OpenAI uses the Responses API. The catalog can include non-text models that are unsuitable for meeting Q&A.
+
+You control the output/reasoning token cap and effort. API usage is billed by your provider; Kura supplies no credits or subscription. Choose local Ollama for answers if you want no paid answer API. Keys for Anthropic, direct OpenAI, and custom endpoints are stored separately in Keychain.
 
 Choose **Custom API (OpenAI-compatible)** in **Settings**, then enter a provider name (for your reference), API base URL, exact model ID, and API key. Kura stores the key in your macOS Keychain.
 
@@ -148,7 +181,10 @@ Sources/Kura/
 
 ```bash
 swift build
+bash check.sh
 ```
+
+`check.sh` runs the standalone Swift regression suite with Command Line Tools; it does not require XCTest or full Xcode. It covers persistence/migration, long transcripts, cancellation, context isolation, speaker parsing, and wrap-up tasks. `bundle.sh` preserves an existing app under `.build/app-backups/` before replacing it. See [implementation notes](IMPLEMENTATION_NOTES.md) for validation and current limitations.
 
 For a diagnostic-friendly overlay, turn on **Debug mode** in Settings and relaunch. Debug mode makes the overlay visible to screenshots so UI issues can be captured and investigated.
 

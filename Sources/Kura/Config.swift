@@ -3,18 +3,13 @@ import Foundation
 import AppKit
 
 enum Config {
-    static let debug = CommandLine.arguments.contains("--debug")
+    static let preview = Bundle.main.bundleIdentifier?.hasSuffix(".preview") == true
+    static let debug = preview || CommandLine.arguments.contains("--debug")
         || ProcessInfo.processInfo.environment["KURA_DEBUG"] == "1"
         || UserDefaults.standard.bool(forKey: "debugMode")
 }
 
 @MainActor
 func restartApp() {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    task.arguments = ["-n", Bundle.main.bundleURL.path]
-    try? task.run()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        NSApp.terminate(nil)
-    }
+    (NSApp.delegate as? AppDelegate)?.requestRestart()
 }

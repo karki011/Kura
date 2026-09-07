@@ -130,10 +130,7 @@ final class HotkeyManager {
             },
             userInfo: nil
         ) else {
-            Task { @MainActor in
-                HotkeyManager.active?.viewModel.lastError = "event tap creation failed — check Accessibility permission"
-                NotificationCenter.default.post(name: .kuraOpenPermissions, object: nil)
-            }
+            // Typing and the visible dictation button remain available without global hold-to-talk.
             return
         }
         eventTap = tap

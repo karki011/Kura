@@ -20,10 +20,10 @@ enum KuraPermission: CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .microphone: return "Required — push-to-talk dictation"
-        case .speech: return "Required — transcribes your voice"
+        case .microphone: return "Dictation and optional own-voice capture"
+        case .speech: return "Apple transcription and dictation; not needed for local system audio"
         case .accessibility: return "Recommended — hold-to-talk from any app"
-        case .screenRecording: return "Optional — auto light/dark card theme"
+        case .screenRecording: return "Optional — observe a selected meeting window"
         }
     }
 
@@ -45,6 +45,43 @@ enum KuraPermission: CaseIterable, Identifiable {
         case .screenRecording: pane = "Privacy_ScreenCapture"
         }
         return URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!
+    }
+}
+
+struct PermissionStatusView: View {
+    @ObservedObject private var manager = PermissionManager.shared
+    var body: some View {
+        WorkspaceSection("Permissions on this Mac") {
+            Text("Checked for this running copy of Kura. A rebuild or a macOS permission change may require granting access again and restarting Kura.")
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(KuraPermission.allCases) { permission in
+                HStack(spacing: 10) {
+                    Image(systemName: permission.icon).frame(width: 22).foregroundStyle(KuraStyle.accent)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(permission.title).font(.callout.weight(.medium))
+                        Text(permission.detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(manager.isGranted(permission) ? "Granted" : "Not granted").font(.caption)
+                        .foregroundStyle(manager.isGranted(permission) ? KuraStyle.accent : .orange)
+                    if !manager.isGranted(permission) {
+                        Button("Grant access…") { manager.requestAndOpen(permission) }.controlSize(.small)
+                    }
+                }.padding(.vertical, 6)
+            }
+            Divider()
+            Label("System audio · verify with Listen", systemImage: "speaker.wave.2.fill").font(.callout.weight(.medium))
+            Text("System-audio recording is separate from microphone and screen access. Kura cannot reliably preflight the process-tap grant: play spoken audio and check the live level meter. If it stays still, enable Kura in Screen & System Audio Recording, then quit and reopen this copy of the app.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Open audio recording permissions…") { manager.openSettings(.screenRecording) }
+            Button("Refresh status") { manager.refresh() }
+        }
+        .task {
+            while !Task.isCancelled {
+                manager.refresh()
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            }
+        }
     }
 }
 

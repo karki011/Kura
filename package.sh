@@ -4,17 +4,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${KURA_VERSION:-1.0.0}"
-APP="Kura.app"
+APP="${KURA_PACKAGE_APP:-.build/release-app/Kura.app}"
 DIST="dist"
 PKG="$DIST/Kura-$VERSION.pkg"
 
 if [ ! -d "$APP" ]; then
-  echo "Kura.app not found; run: swift build -c release && ./bundle.sh" >&2
+  echo "Release app not found; run: bash release.sh --local" >&2
   exit 1
 fi
 
 mkdir -p "$DIST"
-rm -f "$PKG"
+if [ -e "$PKG" ]; then
+  mkdir -p "$DIST/backups"
+  mv "$PKG" "$DIST/backups/Kura-$VERSION-$(date +%Y%m%d-%H%M%S)-$$.pkg"
+fi
 
 INSTALLER_IDENTITY="${KURA_INSTALLER_SIGNING_IDENTITY:-}"
 if [ -z "$INSTALLER_IDENTITY" ]; then

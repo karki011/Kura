@@ -4,12 +4,12 @@ import SwiftUI
 
 @MainActor
 final class OverlayPanel: NSPanel {
-    static let width: CGFloat = 580
+    static let width: CGFloat = 1000
 
     init(viewModel: OverlayViewModel) {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 440),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -23,15 +23,16 @@ final class OverlayPanel: NSPanel {
         // the rounded material treatment; a native shadow reveals a rectangular edge.
         hasShadow = false
         isMovableByWindowBackground = true
-        minSize = NSSize(width: 480, height: 300)
+        minSize = NSSize(width: 900, height: 600)
 
         let hosting = NSHostingController(rootView: OverlayView(viewModel: viewModel))
         hosting.sizingOptions = []
         hosting.view.wantsLayer = true
         hosting.view.layer?.backgroundColor = .clear
         contentViewController = hosting
-        setContentSize(NSSize(width: Self.width, height: 440))
-        positionTopCenter()
+        setContentSize(NSSize(width: Self.width, height: 720))
+        setFrameAutosaveName("KuraWorkspace")
+        if !setFrameUsingName("KuraWorkspace") { positionTopCenter() }
     }
 
     override var canBecomeKey: Bool { true }

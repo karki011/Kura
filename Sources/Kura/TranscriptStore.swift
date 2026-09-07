@@ -1,130 +1,96 @@
-// TranscriptStore — rolling transcript of the conversation (system audio "Them" + push-to-talk "You").
 import Foundation
 
-struct TranscriptLine: Identifiable, Equatable {
-    let id = UUID()
-    let speaker: String // "Them" or "You"
+struct TranscriptLine: Identifiable, Equatable, Codable, Sendable {
+    var id = UUID()
+    var speaker: String
     var text: String
     var isFinal: Bool
+    var timestamp = Date()
+    var source: String = "speech"
+    var suggestedName: String?
+    init(id: UUID = UUID(), speaker: String, text: String, isFinal: Bool = true,
+         timestamp: Date = Date(), source: String = "speech", suggestedName: String? = nil) {
+        self.id = id; self.speaker = speaker; self.text = text; self.isFinal = isFinal
+        self.timestamp = timestamp; self.source = source; self.suggestedName = suggestedName
+    }
+    enum CodingKeys: String, CodingKey { case id, speaker, text, isFinal, timestamp, source, suggestedName }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        speaker = try c.decode(String.self, forKey: .speaker)
+        text = try c.decode(String.self, forKey: .text)
+        isFinal = try c.decodeIfPresent(Bool.self, forKey: .isFinal) ?? true
+        timestamp = try c.decodeIfPresent(Date.self, forKey: .timestamp) ?? .distantPast
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? (speaker == "AI" ? "assistant" : "speech")
+        suggestedName = try c.decodeIfPresent(String.self, forKey: .suggestedName)
+    }
+}
+
+enum ConversationContext {
+    static func recent(_ lines: [TranscriptLine], maxChars: Int = 14000) -> String {
+        guard maxChars > 0 else { return "" }
+        var remaining = maxChars; var selected: [String] = []
+        for line in lines.reversed() where !line.text.isEmpty {
+            let part = String("\(line.speaker): \(line.text)".suffix(remaining))
+            selected.append(part); remaining -= part.count + 1
+            if remaining <= 0 { break }
+        }
+        return selected.reversed().joined(separator: "\n")
+    }
+    static func chunks(_ lines: [TranscriptLine], maxChars: Int = 14000) -> [String] {
+        guard maxChars > 100 else { return [] }
+        var result: [String] = []; var current = ""
+        for line in lines where !line.text.isEmpty && line.source != "assistant" && line.source != "prompt" {
+            let prefix = "[\(line.id.uuidString)] \(line.speaker): "
+            var rest = line.text[...]
+            while !rest.isEmpty {
+                let part = String(rest.prefix(max(1, maxChars - prefix.count - 1)))
+                rest = rest.dropFirst(part.count)
+                let rendered = prefix + part + "\n"
+                if current.count + rendered.count > maxChars, !current.isEmpty { result.append(current); current = "" }
+                current += rendered
+            }
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
 }
 
 @MainActor
 final class TranscriptStore: ObservableObject {
     @Published private(set) var lines: [TranscriptLine] = []
     var onLineFinalized: ((TranscriptLine) -> Void)?
-    private let cap = 500
-
-    /// Fuzzy duplicate check: identical after lowercasing + stripping punctuation,
-    /// or near-prefix (one is ≥80% of the other). Rotation re-recognitions differ
-    /// invisibly (trailing "?", casing), so exact matching misses them.
-    private func isDupe(_ a: String, of b: String) -> Bool {
-        let na = Self.normalized(a), nb = Self.normalized(b)
-        guard !na.isEmpty, !nb.isEmpty else { return false }
-        if na == nb { return true }
-        let shorter = na.count <= nb.count ? na : nb
-        let longer = na.count <= nb.count ? nb : na
-        return shorter.count >= 15
-            && longer.hasPrefix(shorter)
-            && Double(shorter.count) / Double(longer.count) > 0.8
-    }
-
-    private static func normalized(_ s: String) -> String {
-        s.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-
-    private func latestOpenLineIndex(for speaker: String) -> Int? {
-        lines.indices.reversed().first { lines[$0].speaker == speaker && !lines[$0].isFinal }
-    }
-
-    /// Live partial result: rewrites the current open line for that speaker,
-    /// or opens a new line if the last one is finalized / another speaker's.
+    func replace(_ lines: [TranscriptLine]) { self.lines = lines }
     func updatePartial(_ text: String, speaker: String) {
-        // Rotation re-hears the previous window's tail — don't show a partial
-        // that repeats this speaker's last final line.
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty,
-           let prev = lines.last(where: { $0.speaker == speaker && $0.isFinal }),
-           isDupe(trimmed, of: prev.text) {
-            return
-        }
-        if let index = latestOpenLineIndex(for: speaker) {
-            lines[index].text = text
-        } else {
-            append(TranscriptLine(speaker: speaker, text: text, isFinal: false))
-        }
+        if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.isFinal && $0.source == "speech" }) {
+            lines[i].text = text
+        } else if !text.isEmpty { lines.append(TranscriptLine(speaker: speaker, text: text, isFinal: false)) }
     }
-
-    /// Commits the current open line; the next partial opens a fresh one.
     func commitFinal(_ text: String, speaker: String) {
-        // Recognition rotation can re-commit the tail of the previous window —
-        // drop a line that repeats that speaker's previous final line.
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty,
-           let prev = lines.last(where: { $0.speaker == speaker && $0.isFinal }),
-           isDupe(trimmed, of: prev.text) {
-            if let index = latestOpenLineIndex(for: speaker) {
-                lines.remove(at: index)
-            }
-            return
-        }
-        let finalized: TranscriptLine
-        if let index = latestOpenLineIndex(for: speaker) {
-            lines[index].text = text
-            lines[index].isFinal = true
-            finalized = lines[index]
-        } else {
-            let line = TranscriptLine(speaker: speaker, text: text, isFinal: true)
-            append(line)
-            finalized = line
-        }
-        onLineFinalized?(finalized)
+        if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.isFinal && $0.source == "speech" }) {
+            lines[i].text = text; lines[i].isFinal = true
+            if !text.isEmpty { onLineFinalized?(lines[i]) }
+        } else { appendFinal(text, speaker: speaker) }
     }
-
-    func appendFinal(_ text: String, speaker: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        append(TranscriptLine(speaker: speaker, text: trimmed, isFinal: true))
-        if let line = lines.last { onLineFinalized?(line) }
+    func appendFinal(_ text: String, speaker: String, source: String = "speech", timestamp: Date = Date(), suggestedName: String? = nil) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let line = TranscriptLine(speaker: speaker, text: text, timestamp: timestamp, source: source, suggestedName: suggestedName)
+        lines.append(line); onLineFinalized?(line)
     }
-
-    // Streaming-line API for inline AI answers.
     func beginStreaming(speaker: String) -> UUID {
-        let line = TranscriptLine(speaker: speaker, text: "", isFinal: false)
-        append(line)
-        return line.id
+        let line = TranscriptLine(speaker: speaker, text: "", isFinal: false, source: "assistant")
+        lines.append(line); return line.id
     }
-
     func appendDelta(_ delta: String, to id: UUID) {
         guard let i = lines.firstIndex(where: { $0.id == id }) else { return }
         lines[i].text += delta
     }
-
     func finalize(id: UUID, fallback: String? = nil) {
         guard let i = lines.firstIndex(where: { $0.id == id }) else { return }
         if lines[i].text.isEmpty, let fallback { lines[i].text = fallback }
         lines[i].isFinal = true
     }
-
+    func finishOpenLines() { for i in lines.indices { lines[i].isFinal = true } }
     func clear() { lines = [] }
-
-    /// "Them: ...\nYou: ..." oldest→newest, newest lines kept within maxChars.
-    func recentContext(maxChars: Int = 4000) -> String {
-        var picked: [String] = []
-        var total = 0
-        for line in lines.reversed() where !line.text.isEmpty {
-            let rendered = "\(line.speaker): \(line.text)"
-            guard total + rendered.count <= maxChars else { break }
-            picked.append(rendered)
-            total += rendered.count + 1
-        }
-        return picked.reversed().joined(separator: "\n")
-    }
-
-    private func append(_ line: TranscriptLine) {
-        lines.append(line)
-        if lines.count > cap { lines.removeFirst(lines.count - cap) }
-    }
+    func recentContext(maxChars: Int = 14000) -> String { ConversationContext.recent(lines, maxChars: maxChars) }
 }

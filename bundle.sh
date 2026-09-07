@@ -11,11 +11,22 @@ if [ ! -f "$BINARY" ]; then
   exit 1
 fi
 
-APP=Kura.app
-rm -rf "$APP"
+APP="${KURA_APP_OUTPUT:-Kura.app}"
+case "$APP" in
+  Kura.app|"Kura Updated.app"|.build/release-app/Kura.app) ;;
+  *) echo "Unsupported app output path" >&2; exit 1 ;;
+esac
+if [ -e "$APP" ]; then
+  BACKUP=".build/app-backups/Kura-$(date +%Y%m%d-%H%M%S)-$$.app"
+  mkdir -p .build/app-backups
+  mv "$APP" "$BACKUP"
+  echo "Previous app preserved: $BACKUP"
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/Kura"
 cp Kura.icns "$APP/Contents/Resources/Kura.icns"
+cp Sources/Kura/Resources/local_speech.py "$APP/Contents/Resources/local_speech.py"
+cp Sources/Kura/Resources/LOCAL_SPEECH_SETUP.md "$APP/Contents/Resources/LOCAL_SPEECH_SETUP.md"
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -45,9 +56,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 	<key>LSUIElement</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<string>14.2</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Kura uses the microphone for push-to-talk dictation of your questions.</string>
+	<string>Kura uses the microphone for dictation and, when you enable it, to include your voice in meeting notes.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Kura transcribes your dictated questions using speech recognition.</string>
 	<key>NSAudioCaptureUsageDescription</key>

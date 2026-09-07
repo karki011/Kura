@@ -11,27 +11,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var permissionsWindow: NSWindow?
     private var contextWindow: NSWindow?
     private var escapeMonitor: Any?
-    let viewModel = OverlayViewModel()
+    private var statusItem: NSStatusItem?
+    private var restartRequested = false
+    let viewModel = Config.preview ? PreviewFixtures.model() : OverlayViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(Config.debug ? .regular : .accessory)
         installHiddenEditMenu()
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "waveform.bubble", accessibilityDescription: "Kura")
+        let menu = NSMenu()
+        let show = menu.addItem(withTitle: "Show Kura", action: #selector(showFromMenu), keyEquivalent: "")
+        show.target = self
+        let settings = menu.addItem(withTitle: "Settings…", action: #selector(settingsFromMenu), keyEquivalent: "")
+        settings.target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit Kura", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        item.menu = menu; statusItem = item
 
         panel = OverlayPanel(viewModel: viewModel)
-        ThemeSampler.shared.start(panel: panel)
         if viewModel.sidebarOpen {
-            panel.minSize = NSSize(width: 800, height: 300)
-            panel.setContentSize(NSSize(width: 800, height: 440))
-            panel.positionTopCenter()
+            panel.minSize = NSSize(width: 900, height: 600)
+            if !panel.setFrameUsingName("KuraWorkspace") { panel.setContentSize(NSSize(width: 1000, height: 720)); panel.positionTopCenter() }
         }
         viewModel.onSidebarResize = { [weak self] open in
             guard let panel = self?.panel else { return }
-            panel.minSize = NSSize(width: open ? 800 : 480, height: 300)
+            panel.minSize = NSSize(width: open ? 900 : 680, height: 600)
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.2
-                panel.animator().setContentSize(NSSize(width: open ? 800 : OverlayPanel.width, height: 440))
+                ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2
+                panel.animator().setContentSize(NSSize(width: open ? 1000 : 760, height: max(600, panel.frame.height)))
             }
-            panel.positionTopCenter()
+        }
+        viewModel.onCompactResize = { [weak self] compact in
+            guard let panel = self?.panel else { return }
+            panel.minSize = NSSize(width: compact ? 540 : 900, height: compact ? 360 : 600)
+            panel.setContentSize(NSSize(width: compact ? 560 : 1000, height: compact ? 400 : 720))
         }
         hotkeys = HotkeyManager(viewModel: viewModel, panel: panel)
         hotkeys.onToggleOverlay = { [weak self] in self?.toggleOverlay() }
@@ -39,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeys.onOpenSettings = { [weak self] in self?.openSettings() }
         hotkeys.onQuit = { NSApp.terminate(nil) }
         hotkeys.onEndMeeting = { [weak self] in self?.viewModel.assist(.summarize) }
-        hotkeys.register()
+        if !Config.preview { hotkeys.register() }
         NotificationCenter.default.addObserver(forName: .kuraOpenSettings, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.openSettings() }
         }
@@ -53,18 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return event }
             Task { @MainActor in
-                if self?.panel.isVisible == true { self?.hideOverlay() }
+                if self?.panel.isVisible == true, self?.panel.attachedSheet == nil { self?.hideOverlay() }
             }
             return event
         }
 
         // First run (or after a revoked grant): onboard permissions before anything else.
         PermissionManager.shared.refresh()
-        if PermissionManager.shared.requiredGranted {
-            showOverlay()
-        } else {
-            openPermissions()
-        }
+        showOverlay()
     }
 
     // Text-field ⌘C/⌘V/⌘X/⌘A are dispatched via the main menu's key equivalents.
@@ -113,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showOverlay() {
-        panel.positionTopCenter()
+        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) { panel.positionTopCenter() }
         panel.makeKeyAndOrderFront(nil)
         NotificationCenter.default.post(name: .kuraFocusInput, object: nil)
     }
@@ -122,6 +132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if viewModel.status == .listening { viewModel.stopListening() }
         panel.orderOut(nil)
     }
+    @objc private func showFromMenu() { showOverlay() }
+    @objc private func settingsFromMenu() { openSettings() }
 
     func openContext() {
         if let w = contextWindow, w.isVisible {
@@ -145,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
         hosting.sizingOptions = []
         window.contentViewController = hosting
-        window.setContentSize(NSSize(width: 440, height: 320))
+        window.setContentSize(NSSize(width: 614, height: 600))
         window.center()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
@@ -167,17 +179,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "Kura Settings"
+        window.styleMask.insert(.resizable)
+        window.minSize = NSSize(width: 500, height: 540)
         window.level = .statusBar
         window.sharingType = Config.debug ? .readOnly : .none
         window.isReleasedWhenClosed = false
         let hosting = NSHostingController(rootView: SettingsView())
         hosting.sizingOptions = []
         window.contentViewController = hosting
-        window.setContentSize(NSSize(width: 460, height: 540))
+        window.setContentSize(NSSize(width: 580, height: 720))
         window.center()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow = window
+    }
+
+    func requestRestart() {
+        restartRequested = true
+        NSApp.terminate(nil)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        viewModel.stopAnswer(); viewModel.stopListening(); viewModel.stopCapture()
+        Task {
+            do {
+                try await viewModel.prepareToQuit()
+                if restartRequested {
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.createsNewApplicationInstance = true
+                    _ = try await NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
+                }
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            catch {
+                restartRequested = false
+                viewModel.lastError = "Could not save before quitting: \(error.localizedDescription). Please retry after resolving the save error."
+                showOverlay(); sender.reply(toApplicationShouldTerminate: false)
+            }
+        }
+        return .terminateLater
     }
 }
