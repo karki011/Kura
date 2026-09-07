@@ -73,8 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // First run (or after a revoked grant): onboard permissions before anything else.
+        // Deferred a runloop turn: windows ordered in from didFinishLaunching can
+        // stay invisible even though they exist and report as focused.
         PermissionManager.shared.refresh()
-        showOverlay()
+        if !Config.preview && !PermissionManager.shared.requiredGranted {
+            DispatchQueue.main.async { self.openPermissions() }
+        } else { showOverlay() }
     }
 
     // Text-field ⌘C/⌘V/⌘X/⌘A are dispatched via the main menu's key equivalents.
@@ -97,20 +101,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             w.makeKeyAndOrderFront(nil)
             return
         }
+        // Agent apps can't reliably order a titled window in from a cold,
+        // inactive launch. Become a regular app while the wizard is up;
+        // accessory policy returns when the window closes.
+        if !Config.debug { NSApp.setActivationPolicy(.regular) }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 320),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 540),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-        window.title = "Kura Permissions"
+        window.title = "Welcome to Kura"
         window.level = .statusBar
         window.sharingType = Config.debug ? .readOnly : .none
         window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: PermissionsView { [weak self] in
+        window.contentViewController = NSHostingController(rootView: OnboardingView { [weak self] in
             self?.permissionsWindow?.close()
             self?.showOverlay()
         })
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                if self?.panel.isVisible == false && !Config.debug { NSApp.setActivationPolicy(.accessory) }
+            }
+        }
         window.center()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()

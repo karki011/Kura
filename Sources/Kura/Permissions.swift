@@ -74,6 +74,7 @@ struct PermissionStatusView: View {
             Text("System-audio recording is separate from microphone and screen access. Kura cannot reliably preflight the process-tap grant: play spoken audio and check the live level meter. If it stays still, enable Kura in Screen & System Audio Recording, then quit and reopen this copy of the app.")
                 .font(.caption).foregroundStyle(.secondary)
             Button("Open audio recording permissions…") { manager.openSettings(.screenRecording) }
+            Button("Open step-by-step guide…") { NotificationCenter.default.post(name: .kuraOpenPermissions, object: nil) }
             Button("Refresh status") { manager.refresh() }
         }
         .task {
@@ -109,6 +110,27 @@ final class PermissionManager: ObservableObject {
         case .speech: return speech == .authorized
         case .accessibility: return accessibility
         case .screenRecording: return screenRecording
+        }
+    }
+
+    // Adds Kura to the Accessibility pane list without showing a dialog, so the
+    // onboarding guide can truthfully say "find Kura in the list".
+    func preseedAccessibility() {
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": false] as CFDictionary)
+    }
+
+    // Fire only the system request (no settings pane). Used by onboarding for
+    // prompt-capable permissions; denied states go through openSettings instead.
+    func request(_ p: KuraPermission) {
+        switch p {
+        case .microphone:
+            AVCaptureDevice.requestAccess(for: .audio) { _ in Task { @MainActor in self.refresh() } }
+        case .speech:
+            SFSpeechRecognizer.requestAuthorization { @Sendable _ in Task { @MainActor in self.refresh() } }
+        case .accessibility:
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        case .screenRecording:
+            CGRequestScreenCaptureAccess()
         }
     }
 
@@ -155,65 +177,6 @@ final class PermissionManager: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             self.openSettings(p)
         }
-    }
-}
-
-struct PermissionsView: View {
-    @ObservedObject var manager = PermissionManager.shared
-    var onContinue: () -> Void
-    @State private var pollTimer: Timer?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Kura needs a few permissions")
-                .font(.headline)
-            Text("Grant these once — macOS remembers them for this app.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            ForEach(KuraPermission.allCases) { p in
-                HStack(spacing: 10) {
-                    Image(systemName: p.icon)
-                        .frame(width: 20)
-                        .foregroundStyle(manager.isGranted(p) ? .green : .secondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(p.title).font(.system(size: 13, weight: .medium))
-                        Text(p.detail).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if manager.isGranted(p) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    } else {
-                        Button("Open Settings") { manager.requestAndOpen(p) }
-                            .controlSize(.small)
-                            .pointingHandCursor()
-                    }
-                }
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.25)))
-            }
-
-            HStack {
-                Button("Ask macOS to prompt me") { manager.requestAll() }
-                    .controlSize(.small)
-                    .pointingHandCursor()
-                Spacer()
-                Button("Continue") { onContinue() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!manager.requiredGranted)
-                    .pointingHandCursor(enabled: manager.requiredGranted)
-            }
-        }
-        .padding(16)
-        .frame(width: 400)
-        .preferredColorScheme(.dark)
-        .onAppear {
-            manager.refresh()
-            pollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-                Task { @MainActor in manager.refresh() }
-            }
-        }
-        .onDisappear { pollTimer?.invalidate(); pollTimer = nil }
     }
 }
 
