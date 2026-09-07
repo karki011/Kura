@@ -5,12 +5,14 @@ struct OpenAIResponsesProvider: LLMProvider {
     let model: String
     var effort = "default"
     var tokenLimit = 4096
+    var fastMode = false
 
     func requestBody(messages: [LLMMessage], system: String) -> [String: Any] {
         var body: [String: Any] = ["model": model, "instructions": system, "stream": true, "store": false,
                                    "max_output_tokens": tokenLimit,
                                    "input": messages.map { ["role": $0.role, "content": $0.content] }]
         if effort != "default" { body["reasoning"] = ["effort": effort] }
+        if fastMode { body["service_tier"] = "priority" }
         return body
     }
     static func textDelta(_ data: Data) throws -> String? {
@@ -29,6 +31,7 @@ struct OpenAIResponsesProvider: LLMProvider {
                     guard !apiKey.isEmpty else { throw LLMError.missingAPIKey("OpenAI") }
                     var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
                     request.httpMethod = "POST"
+                    request.timeoutInterval = 20 // Idle-stall abort; the timer resets as deltas arrive.
                     request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(messages: messages, system: system))

@@ -84,7 +84,7 @@ done
 
 if [ -n "$IDENTITY" ]; then
   if [[ "$IDENTITY" == Developer\ ID\ Application:* ]]; then
-    codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    codesign --force --deep --options runtime --timestamp --entitlements Kura.entitlements --sign "$IDENTITY" "$APP"
   else
     codesign --force --deep --sign "$IDENTITY" "$APP"
   fi

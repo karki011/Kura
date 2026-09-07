@@ -32,11 +32,31 @@ enum SpokenQuestion {
         let words = value.split { !$0.isLetter && !$0.isNumber }
         guard words.count >= 3 else { return false }
         let normalized = words.joined(separator: " ")
-        return value.hasSuffix("?") || [
+        if value.hasSuffix("?") || [
             "what ", "how ", "why ", "when ", "where ", "which ", "who ",
             "can you ", "could you ", "would you ", "should we ", "do you ",
             "does ", "is there ", "are there ", "explain ", "tell me ",
-            "describe ", "walk me ", "give me "
-        ].contains { normalized.hasPrefix($0) }
+            "describe ", "walk me ", "give me ",
+            "design ", "write ", "draft ", "create ", "build ", "summarize ",
+            "list ", "compare ", "define ", "calculate ", "outline ", "sketch ",
+            "show me ", "help me "
+        ].contains(where: { normalized.hasPrefix($0) }) { return true }
+        // Transcription drops question marks and real questions often start with
+        // a preamble ("hey team, quick question — what is …"), so also match
+        // question phrases anywhere in the line.
+        return [
+            "what is", "what are", "what was", "what were", "what do", "what does",
+            "what did", "what can", "what could", "what should", "what would",
+            "how do", "how does", "how did", "how can", "how could", "how should",
+            "how would", "how much", "how many", "how long",
+            "why is", "why are", "why do", "why does", "why did",
+            "when is", "when are", "when do", "when does", "when did", "when will",
+            "where is", "where are", "where do", "where does", "where should",
+            "which is", "which are", "which one", "which should",
+            "who is", "who are", "who will",
+            "can you", "could you", "would you", "should we", "do you",
+            "does anyone", "is there", "are there",
+            "tell me", "walk me through", "give me"
+        ].contains { normalized.contains($0) }
     }
 }

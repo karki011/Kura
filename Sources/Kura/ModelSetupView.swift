@@ -15,6 +15,7 @@ struct ModelSetupView: View {
     @State private var showingEffort = false
     @State private var task: Task<Void, Never>?
     @AppStorage("answerTokenLimit") private var tokenLimit = 4096
+    @AppStorage("openAIFastMode") private var fastMode = true
     private var levels: [String] {
         if provider == .anthropic { return models.first { $0.id == model }?.efforts ?? [] }
         return ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -28,6 +29,7 @@ struct ModelSetupView: View {
                 }
                 .accessibilityLabel("Choose model")
                 .help("Choose a model · \(provider.displayName)")
+                .buttonStyle(KuraChipButtonStyle())
                 .popover(isPresented: $showingModels) {
                     modelChooser.padding(16).frame(width: 360).modifier(KuraAppearance())
                 }
@@ -36,6 +38,7 @@ struct ModelSetupView: View {
                         .lineLimit(1)
                 }
                 .accessibilityLabel("Reasoning effort")
+                .buttonStyle(KuraChipButtonStyle())
                 .popover(isPresented: $showingEffort) {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Reasoning effort").font(.headline)
@@ -60,6 +63,11 @@ struct ModelSetupView: View {
                 Text("Choose a model above, or enter its ID in the model picker. Refresh the catalog using your saved key.").font(.caption).foregroundStyle(.secondary)
                 Text(provider == .anthropic ? "Claude effort choices come from its model capabilities." : "The catalog may include non-text models. Choose a text-generation model. Effort support varies by model.").font(.caption).foregroundStyle(.secondary)
                 Text("Higher reasoning effort can increase latency and API cost. Your own provider key pays for requests; Kura supplies no credits.").font(.caption).foregroundStyle(.secondary)
+                if provider == .openAI {
+                    Toggle("Fast mode (priority processing)", isOn: $fastMode).font(.callout)
+                    Text("OpenAI's priority service tier: faster, more consistent answers at a higher per-token price. Turn off for standard pricing.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Stepper("Output + reasoning budget: \(tokenLimit) tokens", value: $tokenLimit, in: 1024...65536, step: 1024).font(.callout)
                 Text("A request cap, not a spending limit. High effort may need more room before it can produce an answer.").font(.caption).foregroundStyle(.secondary)
             }

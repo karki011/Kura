@@ -7,6 +7,18 @@ enum KuraStyle {
     static let muted = Color.secondary
 }
 
+struct KuraChipButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(KuraStyle.accent.opacity(configuration.isPressed ? 0.3 : 0.14), in: Capsule())
+            .overlay(Capsule().stroke(KuraStyle.accent.opacity(0.3), lineWidth: 1))
+            .foregroundStyle(KuraStyle.accent)
+            .contentShape(Capsule())
+    }
+}
+
 struct OverlayView: View {
     @ObservedObject var viewModel: OverlayViewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -141,9 +153,9 @@ struct OverlayView: View {
                                 if $0.meta.title.isEmpty { $0.meta.title = name }
                                 $0.goal = name == "Planning" ? "Agree on priorities, owners, and next steps." : name == "Customer call" ? "Understand needs, resolve questions, and agree on a next step." : "Explore possibilities and select ideas worth trying."
                             }
-                        }.controlSize(.small)
+                        }
                     }
-                }
+                }.buttonStyle(KuraChipButtonStyle())
                 Button("Choose a meeting window…") { showCapture = true }.buttonStyle(.link)
             }
             Spacer(minLength: 0)
@@ -156,7 +168,7 @@ struct OverlayView: View {
                 Button("Suggest a response") { viewModel.assist(.whatToSay) }
                 Button("Capture decision") { viewModel.captureDecision() }
                 Button("Wrap up", systemImage: "checkmark.circle") { viewModel.assist(.summarize) }
-            }.controlSize(.small).disabled(viewModel.status == .streaming).padding(.horizontal, 16).padding(.vertical, 8)
+            }.buttonStyle(KuraChipButtonStyle()).disabled(viewModel.status == .streaming).padding(.horizontal, 16).padding(.vertical, 8)
         }
     }
     private var composer: some View {

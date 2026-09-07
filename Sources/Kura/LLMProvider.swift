@@ -25,6 +25,46 @@ protocol LLMProvider: Sendable {
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error>
 }
 
+enum StreamTiming {
+    /// Lets the first-delta race and the steady-state drain share one iterator;
+    /// only one task calls next() at a time.
+    private final class IteratorBox: @unchecked Sendable {
+        var iterator: AsyncThrowingStream<String, Error>.Iterator
+        init(_ stream: AsyncThrowingStream<String, Error>) { iterator = stream.makeAsyncIterator() }
+    }
+
+    /// Fails if the first delta takes longer than `seconds`; later deltas pass through unthrottled.
+    /// URLSession's per-request idle timeout still covers stalls after the first delta.
+    static func firstDelta(_ stream: AsyncThrowingStream<String, Error>, within seconds: Double) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let box = IteratorBox(stream)
+                    let first: String? = try await withThrowingTaskGroup(of: String?.self) { group in
+                        group.addTask { try await box.iterator.next() }
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(seconds))
+                            try Task.checkCancellation()
+                            throw KuraError.message("No response within \(Int(seconds)) seconds.")
+                        }
+                        let value = try await group.next()!
+                        group.cancelAll()
+                        return value
+                    }
+                    if let first {
+                        continuation.yield(first)
+                        while let delta = try await box.iterator.next() {
+                            try Task.checkCancellation(); continuation.yield(delta)
+                        }
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 /// Security may wait for a macOS access prompt. Never do that on the UI thread.
 struct KeychainBackedProvider: LLMProvider {
     let account: String

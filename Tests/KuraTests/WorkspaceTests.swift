@@ -264,10 +264,12 @@ struct WorkspaceTests {
         try await model.flush()
     }
     func spokenQuestionDetection() throws {
-        for text in ["What is 2+2", "Who sends the brief", "When is launch", "Where should this go", "Could you explain caching", "Tell me about queues", "Is there a deadline", "Ready for launch?"] {
+        for text in ["What is 2+2", "Who sends the brief", "When is launch", "Where should this go", "Could you explain caching", "Tell me about queues", "Is there a deadline", "Ready for launch?",
+                     "Hey team quick question what is the capital of France", "So how do we handle retries", "Before we wrap, when is the deadline",
+                     "Design simple rate limiter", "Summarize the discussion so far"] {
             try check(SpokenQuestion.matches(text))
         }
-        for text in ["", "What", "We launch on Friday", "The answer is four"] {
+        for text in ["", "What", "We launch on Friday", "The answer is four", "I know what you mean"] {
             try check(!SpokenQuestion.matches(text))
         }
     }

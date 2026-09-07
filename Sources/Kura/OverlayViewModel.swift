@@ -105,7 +105,7 @@ final class OverlayViewModel: ObservableObject {
         transcript.$lines.dropFirst().sink { [weak self] lines in self?.session.lines = lines }.store(in: &subscriptions)
         meetings.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         observer.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
-        transcript.onLineFinalized = { [weak self] line in self?.scheduleAnswer(line) }
+        transcript.onLineFinalized = { [weak self] line in self?.scheduleAnswer(line); self?.maybeGenerateTitle() }
         speech.onPartialResult = { [weak self] text in
             guard let self, self.status == .listening else { return }
             self.question = self.preListenBase.isEmpty ? text : self.preListenBase + " " + text
@@ -387,6 +387,28 @@ final class OverlayViewModel: ObservableObject {
     private func cancelPendingAnswer() {
         pendingAnswerID = UUID(); qaDebounce?.cancel(); qaDebounce = nil; autoAnswerStatus = ""
     }
+    private var titleAttempts = 0
+    // One-shot: name the meeting from its opening conversation unless the user already did.
+    private func maybeGenerateTitle() {
+        guard titleAttempts < 3, selected == nil, session.meta.title.isEmpty else { return }
+        let speech = session.lines.filter { $0.source == "speech" && $0.isFinal && !$0.text.isEmpty }
+        let material = speech.map(\.text).joined(separator: " ")
+        guard speech.count >= 4 || material.count >= 200 else { return }
+        titleAttempts += 1
+        let target = session.id
+        Task { [weak self] in
+            guard let self else { return }
+            var name = ""
+            do {
+                let prompt = "Name this meeting in 6 words or fewer, based on its opening. Reply with only the title, no quotes, no trailing punctuation.\n\n\(material.prefix(1500))"
+                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [LLMMessage(role: "user", content: prompt)], system: "You write short meeting titles."), within: 8)
+                for try await delta in stream { name += delta }
+            } catch { return }
+            let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'."))
+            guard !cleaned.isEmpty, self.session.id == target, self.session.meta.title.isEmpty else { return }
+            self.editCurrent { $0.meta.title = String(cleaned.prefix(60)) }
+        }
+    }
     private func append(_ line: TranscriptLine, target: UUID) {
         if target == session.id { var lines = transcript.lines; lines.append(line); transcript.replace(lines) }
         else if selected?.id == target { selected?.lines.append(line) }
@@ -409,24 +431,37 @@ final class OverlayViewModel: ObservableObject {
         streamTask = Task { [weak self] in
             guard let self else { return }
             var pending = ""; var full = ""; var lastFlush = Date()
-            do {
-                for try await delta in self.providerFactory().stream(messages: messages, system: systemPrompt) {
-                    try Task.checkCancellation(); guard self.requestID == token else { return }
-                    pending += delta; full += delta
-                    if Date().timeIntervalSince(lastFlush) >= 0.08 {
-                        let batch = pending; pending = ""; lastFlush = Date()
-                        self.updateLine(line.id, target: snapshot.id) { $0.text += batch }
+            var attempt = 0
+            while true {
+                attempt += 1
+                do {
+                    let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: messages, system: systemPrompt), within: 5)
+                    for try await delta in stream {
+                        try Task.checkCancellation(); guard self.requestID == token else { return }
+                        pending += delta; full += delta
+                        if Date().timeIntervalSince(lastFlush) >= 0.08 {
+                            let batch = pending; pending = ""; lastFlush = Date()
+                            self.updateLine(line.id, target: snapshot.id) { $0.text += batch }
+                        }
                     }
+                    try Task.checkCancellation(); guard self.requestID == token else { return }
+                    guard !full.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KuraError.message("The provider returned no text. Check the model settings and retry.") }
+                    self.updateLine(line.id, target: snapshot.id) { $0.text = full; $0.isFinal = true }
+                    if followUp { self.editCurrent { $0.wrapUp.followUp = full }; self.tab = .wrapUp }
+                    self.finishRequest(token)
+                    return
+                } catch {
+                    guard self.requestID == token else { return }
+                    // A stall before any text is retryable once; a failed retry or a
+                    // mid-answer failure keeps whatever text already arrived.
+                    if full.isEmpty && attempt < 2 && !Task.isCancelled {
+                        self.notice = "No response in 5s — retrying…"
+                        continue
+                    }
+                    self.updateLine(line.id, target: snapshot.id) { $0.text = full.isEmpty ? "Answer interrupted" : full; $0.isFinal = true }
+                    self.lastError = error.localizedDescription; self.finishRequest(token)
+                    return
                 }
-                try Task.checkCancellation(); guard self.requestID == token else { return }
-                guard !full.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KuraError.message("The provider returned no text. Check the model settings and retry.") }
-                self.updateLine(line.id, target: snapshot.id) { $0.text = full; $0.isFinal = true }
-                if followUp { self.editCurrent { $0.wrapUp.followUp = full }; self.tab = .wrapUp }
-                self.finishRequest(token)
-            } catch {
-                guard self.requestID == token else { return }
-                self.updateLine(line.id, target: snapshot.id) { $0.text = full.isEmpty ? "Answer interrupted" : full; $0.isFinal = true }
-                self.lastError = error.localizedDescription; self.finishRequest(token)
             }
         }
     }

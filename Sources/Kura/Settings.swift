@@ -68,8 +68,9 @@ struct SettingsStore: Sendable {
             }
         case .openAI:
             let model = activeModel, effort = defaults.string(forKey: "directOpenAIEffort") ?? "default", limit = answerTokenLimit
+            let fast = defaults.object(forKey: "openAIFastMode") as? Bool ?? true
             return KeychainBackedProvider(account: "openai-direct") { key in
-                OpenAIResponsesProvider(apiKey: key, model: model, effort: effort, tokenLimit: limit)
+                OpenAIResponsesProvider(apiKey: key, model: model, effort: effort, tokenLimit: limit, fastMode: fast)
             }
         case .openAICompatible:
             let base = openAIBaseURL, model = openAIModel, effort = reasoningEffort
