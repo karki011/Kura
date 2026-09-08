@@ -60,6 +60,7 @@ final class OverlayViewModel: ObservableObject {
     @Published var favoriteOnly = false
     @Published var scrollTarget: UUID?
     @Published var lastDeleted: UUID?
+    @Published private(set) var lastAutoBinding: AutoSpeakerBinding?
     @Published var progress = ""
     @Published private(set) var autoAnswerStatus = ""
     @Published var autoQA = UserDefaults.standard.bool(forKey: "autoQA") {
@@ -73,6 +74,7 @@ final class OverlayViewModel: ObservableObject {
     let speech = SpeechManager()
     private let ownSpeech = SpeechManager()
     let observer = MeetingWindowObserver()
+    let watcher = MeetingAppWatcher()
     private let screenAudio = ScreenAudioManager()
     private var subscriptions = Set<AnyCancellable>()
     private var saveTask: Task<Void, Never>?
@@ -91,6 +93,7 @@ final class OverlayViewModel: ObservableObject {
     private var preListenBase = ""
     private var audioEpoch = UUID()
     private var speakerNames: [String: String] = [:]
+    private var bindingTracker = SpeakerBindingTracker()
     private var captureStopTask: Task<Void, Never>?
     private var modelPrepareTask: Task<Void, Never>?
     private var previewCaptureTask: Task<Void, Never>?
@@ -122,6 +125,7 @@ final class OverlayViewModel: ObservableObject {
         transcript.$lines.dropFirst().sink { [weak self] lines in self?.session.lines = lines }.store(in: &subscriptions)
         meetings.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         observer.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
+        watcher.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         transcript.onLineFinalized = { [weak self] line in self?.scheduleAnswer(line); self?.maybeGenerateTitle() }
         speech.onPartialResult = { [weak self] text in
             guard let self, self.status == .listening else { return }
@@ -209,7 +213,7 @@ final class OverlayViewModel: ObservableObject {
                 let fresh = Meeting.empty()
                 try await meetings.save(fresh, draft: true)
                 session = fresh; selected = nil; transcript.clear()
-                speakerNames = [:]; answeredLines = []; question = ""; lastRequest = nil
+                speakerNames = [:]; bindingTracker.reset(); lastAutoBinding = nil; answeredLines = []; question = ""; lastRequest = nil
                 tab = .transcript; captureStatus = "Ready when you are"; notice = "A fresh start. Add a goal or drop in your notes."
             } catch { lastError = "Could not start a new session: \(error.localizedDescription). Your current meeting is preserved." }
             transitioning = false
@@ -311,7 +315,8 @@ final class OverlayViewModel: ObservableObject {
             guard let self, self.audioEpoch == epoch else { return }
             let raw = segment.speaker < 0 ? "Unknown speaker" : "Speaker \(offset + segment.speaker + 1)"
             let speaker = self.speakerNames[raw] ?? raw
-            self.transcript.appendFinal(segment.text, speaker: speaker, timestamp: captureStarted.addingTimeInterval(segment.start), suggestedName: self.observer.suggestedName(for: segment.text))
+            self.transcript.appendFinal(segment.text, speaker: speaker, timestamp: captureStarted.addingTimeInterval(segment.start), suggestedName: self.suggestedName(for: segment.text))
+            if let cue = self.activeSpeakerCue() { self.recordSpeakerCue(name: cue, slot: raw) }
         }
         screenAudio.onLevel = { [weak self] level in
             guard let self, self.audioEpoch == epoch, self.alwaysOnActive else { return }
@@ -375,7 +380,7 @@ final class OverlayViewModel: ObservableObject {
         previewCaptureTask?.cancel(); previewCaptureTask = nil
         captureHealthTask?.cancel(); captureHealthTask = nil
         ownSpeech.stop(); ownVoiceActive = false
-        observer.stop(); audioLevel = 0; captureStatus = "Paused"
+        observer.stop(); watcher.stop(); audioLevel = 0; captureStatus = "Paused"
         cancelPendingAnswer()
         captureStopTask = Task {
             await screenAudio.stopAndDrain()
@@ -630,6 +635,48 @@ final class OverlayViewModel: ObservableObject {
         append(TranscriptLine(speaker: "You", text: value, source: "decision"), target: current.id)
         question = ""; notice = "Decision captured"
     }
+    // Speaker-name cues from whichever observation source is active (Accessibility
+    // app watcher preferred, screenshot-OCR window observer as fallback).
+    private func activeSpeakerCue() -> String? {
+        watcher.recentSpeakerSuggestion ?? observer.recentSpeakerSuggestion
+    }
+    private func suggestedName(for text: String) -> String? {
+        watcher.suggestedName(for: text) ?? observer.suggestedName(for: text)
+    }
+    // An active-speaker cue coinciding with a diarization slot is evidence for
+    // binding that name to the slot. Only two coincidences on the same slot
+    // auto-assign; a manually named slot and the "You" mic speaker are never touched.
+    func recordSpeakerCue(name: String, slot: String) {
+        guard slot != "You", !name.isEmpty else { return }
+        guard speakerNames[slot] == nil else { return }
+        bindingTracker.record(name: name, slot: slot)
+        guard bindingTracker.confirmedSlot(for: name) == slot else { return }
+        applyAutoBinding(name: name, slot: slot)
+    }
+    private func applyAutoBinding(name: String, slot: String) {
+        speakerNames[slot] = name
+        var renamed: [UUID] = []
+        var lines = transcript.lines
+        for i in lines.indices where lines[i].speaker == slot {
+            lines[i].speaker = name
+            if lines[i].suggestedName == name { lines[i].suggestedName = nil }
+            renamed.append(lines[i].id)
+        }
+        transcript.replace(lines)
+        lastAutoBinding = AutoSpeakerBinding(slot: slot, previousName: nil, name: name, lineIDs: renamed)
+        notice = "Identified \(name)"
+    }
+    func undoAutoBinding() {
+        guard let binding = lastAutoBinding else { return }
+        if let previous = binding.previousName { speakerNames[binding.slot] = previous }
+        else { speakerNames.removeValue(forKey: binding.slot) }
+        var lines = transcript.lines
+        for i in lines.indices where binding.lineIDs.contains(lines[i].id) { lines[i].speaker = binding.slot }
+        transcript.replace(lines)
+        bindingTracker.clear(name: binding.name)
+        lastAutoBinding = nil
+        notice = "Identification undone"
+    }
     func correctLine(_ line: TranscriptLine, text: String, speaker: String, renameAll: Bool) {
         let name = speaker.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
@@ -700,6 +747,13 @@ final class OverlayViewModel: ObservableObject {
             }
         }
     }
+}
+
+struct AutoSpeakerBinding {
+    let slot: String
+    let previousName: String?
+    let name: String
+    let lineIDs: [UUID]
 }
 
 enum KuraError: LocalizedError {

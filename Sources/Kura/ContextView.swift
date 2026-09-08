@@ -53,6 +53,7 @@ struct CaptureSetupView: View {
     @ObservedObject var model: OverlayViewModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage("includeMicrophone") private var includeMicrophone = false
+    @AppStorage("speakerCueSource") private var cueSource = "app"
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack { Text("Connect your meeting").font(.title2.bold()); Spacer(); Button("Done") { dismiss() } }
@@ -69,25 +70,51 @@ struct CaptureSetupView: View {
                     }
                 }.padding(6).frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox("Optional window observation") {
+            GroupBox("Speaker name cues") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Read visible meeting text on this Mac to suggest speaker names. Images are not saved or sent to an AI provider. Screen Recording permission is needed.").font(.caption).foregroundStyle(.secondary)
-                    HStack {
-                        Picker("Window", selection: Binding(get: { model.observer.selectedID }, set: { model.observer.selectedID = $0 })) {
-                            Text("Choose a window").tag(Optional<CGWindowID>.none)
-                            ForEach(model.observer.windows) { window in Text(window.title).tag(Optional(window.id)) }
-                        }.disabled(model.observer.observing)
-                        Button("Refresh") { model.observer.refresh() }.disabled(model.observer.observing)
-                    }
-                    HStack {
-                        Button(model.observer.observing ? "Stop observation" : "Observe selected window") { if model.observer.observing { model.observer.stop() } else { model.observer.start() } }
-                            .disabled(!model.observer.observing && model.observer.selectedID == nil)
-                        if model.observer.observing { Image(systemName: "eye.fill").foregroundStyle(KuraStyle.accent) }
-                    }
-                    Text(model.observer.status).font(.caption).foregroundStyle(.secondary)
-                    Text("Turn on your meeting’s captions for better name suggestions. Kura matches visible caption text or explicit speaking labels; confirm each name in the transcript. Gallery borders and overlapping speech may not provide a reliable cue.").font(.caption).foregroundStyle(.secondary)
-                    if !model.observer.visibleText.isEmpty {
-                        DisclosureGroup("Visible text preview") { ScrollView { Text(model.observer.visibleText).textSelection(.enabled).font(.caption).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 90) }
+                    Picker("Source", selection: $cueSource) {
+                        Text("Meeting app").tag("app")
+                        Text("Read screen pixels instead").tag("pixels")
+                    }.pickerStyle(.segmented).labelsHidden()
+                        .disabled(model.watcher.observing || model.observer.observing)
+                    if cueSource == "app" {
+                        Text("Read the meeting app's interface on this Mac to suggest speaker names. Nothing is saved or sent to an AI provider. Uses the Accessibility access Kura already has for shortcuts.").font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Picker("App", selection: Binding(get: { model.watcher.selectedPID }, set: { model.watcher.selectedPID = $0 })) {
+                                Text("Choose an app").tag(Optional<pid_t>.none)
+                                ForEach(model.watcher.apps) { app in Text(app.name).tag(Optional(app.id)) }
+                            }.disabled(model.watcher.observing)
+                            Button("Refresh") { model.watcher.refresh() }.disabled(model.watcher.observing)
+                        }
+                        HStack {
+                            Button(model.watcher.observing ? "Stop observation" : "Observe selected app") { if model.watcher.observing { model.watcher.stop() } else { model.watcher.start() } }
+                                .disabled(!model.watcher.observing && model.watcher.selectedPID == nil)
+                            if model.watcher.observing { Image(systemName: "eye.fill").foregroundStyle(KuraStyle.accent) }
+                        }
+                        Text(model.watcher.status).font(.caption).foregroundStyle(.secondary)
+                        Text("Kura reads explicit speaking indicators and caption text from the app. After the same name matches the same voice twice, Kura identifies the speaker — you can undo.").font(.caption).foregroundStyle(.secondary)
+                        if !model.watcher.visibleText.isEmpty {
+                            DisclosureGroup("Visible text preview") { ScrollView { Text(model.watcher.visibleText).textSelection(.enabled).font(.caption).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 90) }
+                        }
+                    } else {
+                        Text("Read visible meeting text on this Mac to suggest speaker names. Images are not saved or sent to an AI provider. Screen Recording permission is needed.").font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Picker("Window", selection: Binding(get: { model.observer.selectedID }, set: { model.observer.selectedID = $0 })) {
+                                Text("Choose a window").tag(Optional<CGWindowID>.none)
+                                ForEach(model.observer.windows) { window in Text(window.title).tag(Optional(window.id)) }
+                            }.disabled(model.observer.observing)
+                            Button("Refresh") { model.observer.refresh() }.disabled(model.observer.observing)
+                        }
+                        HStack {
+                            Button(model.observer.observing ? "Stop observation" : "Observe selected window") { if model.observer.observing { model.observer.stop() } else { model.observer.start() } }
+                                .disabled(!model.observer.observing && model.observer.selectedID == nil)
+                            if model.observer.observing { Image(systemName: "eye.fill").foregroundStyle(KuraStyle.accent) }
+                        }
+                        Text(model.observer.status).font(.caption).foregroundStyle(.secondary)
+                        Text("Turn on your meeting’s captions for better name suggestions. Kura matches visible caption text or explicit speaking labels; confirm each name in the transcript. Gallery borders and overlapping speech may not provide a reliable cue.").font(.caption).foregroundStyle(.secondary)
+                        if !model.observer.visibleText.isEmpty {
+                            DisclosureGroup("Visible text preview") { ScrollView { Text(model.observer.visibleText).textSelection(.enabled).font(.caption).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 90) }
+                        }
                     }
                 }.padding(6)
             }

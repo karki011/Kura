@@ -22,8 +22,8 @@ enum KuraPermission: CaseIterable, Identifiable {
         switch self {
         case .microphone: return "Dictation and optional own-voice capture"
         case .speech: return "Apple transcription and dictation; not needed for local system audio"
-        case .accessibility: return "Recommended — hold-to-talk from any app"
-        case .screenRecording: return "Optional — observe a selected meeting window"
+        case .accessibility: return "Recommended — hold-to-talk and reading speaker names from the meeting app"
+        case .screenRecording: return "Optional — observe a selected meeting window (fallback name cues)"
         }
     }
 

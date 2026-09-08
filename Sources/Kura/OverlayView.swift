@@ -217,7 +217,10 @@ struct OverlayView: View {
                 }.font(.caption)
             }
             if !viewModel.notice.isEmpty {
-                HStack { Text(viewModel.notice).lineLimit(2); if viewModel.lastDeleted != nil { Button("Undo") { viewModel.undoDelete() } }; Spacer(); Button { viewModel.notice = "" } label: { Image(systemName: "xmark") }.buttonStyle(.plain).accessibilityLabel("Dismiss notice") }.font(.caption).foregroundStyle(.secondary)
+                HStack { Text(viewModel.notice).lineLimit(2)
+                    if viewModel.lastDeleted != nil { Button("Undo") { viewModel.undoDelete() } }
+                    else if viewModel.lastAutoBinding != nil { Button("Undo") { viewModel.undoAutoBinding() } }
+                    Spacer(); Button { viewModel.notice = "" } label: { Image(systemName: "xmark") }.buttonStyle(.plain).accessibilityLabel("Dismiss notice") }.font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Label(viewModel.saveStatus, systemImage: viewModel.saveStatus == "Saved locally" ? "checkmark.shield" : "externaldrive")

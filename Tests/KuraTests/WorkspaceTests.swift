@@ -72,7 +72,8 @@ struct WorkspaceTests {
             ("newMeetingArchivesAndClearsContext", { try await suite.newMeetingArchivesAndClearsContext() }),
             ("contextImportAndPackActions", { try await suite.contextImportAndPackActions() }),
             ("historySearchFavoriteDeleteAndUndo", { try await suite.historySearchFavoriteDeleteAndUndo() }),
-            ("decisionAndFollowUpActions", { try await suite.decisionAndFollowUpActions() })
+            ("decisionAndFollowUpActions", { try await suite.decisionAndFollowUpActions() }),
+            ("speakerBindingEvidenceAndUndo", { try await suite.speakerBindingEvidenceAndUndo() })
         ]
         for (name, run) in checks {
             do { try await run(); print("PASS \(name)") }
@@ -566,6 +567,50 @@ struct WorkspaceTests {
         model.undoDelete()
         for _ in 0..<100 where model.lastDeleted != nil { try await Task.sleep(for: .milliseconds(10)) }
         try check(model.meetings.meetings.first?.id == saved.id)
+        try await model.flush()
+    }
+    @MainActor func speakerBindingEvidenceAndUndo() async throws {
+        // Pure tracker: one coincidence never binds; evidence split across slots never binds.
+        var tracker = SpeakerBindingTracker()
+        tracker.record(name: "Alex", slot: "Speaker 1")
+        try check(tracker.confirmedSlot(for: "Alex") == nil)
+        tracker.record(name: "Alex", slot: "Speaker 2")
+        try check(tracker.confirmedSlot(for: "Alex") == nil)
+        tracker.record(name: "Alex", slot: "Speaker 1")
+        try check(tracker.confirmedSlot(for: "Alex") == "Speaker 1")
+        // Tied evidence on two slots stays ambiguous.
+        var tied = SpeakerBindingTracker()
+        tied.record(name: "Jamie", slot: "Speaker 1"); tied.record(name: "Jamie", slot: "Speaker 1")
+        tied.record(name: "Jamie", slot: "Speaker 2"); tied.record(name: "Jamie", slot: "Speaker 2")
+        try check(tied.confirmedSlot(for: "Jamie") == nil)
+
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = OverlayViewModel(root: root, restore: false)
+        model.transcript.appendFinal("We should ship on Friday", speaker: "Speaker 1")
+        // A single coincidence never renames.
+        model.recordSpeakerCue(name: "Alex", slot: "Speaker 1")
+        try check(model.transcript.lines.last?.speaker == "Speaker 1")
+        try check(model.lastAutoBinding == nil)
+        // Two coincidences on the same slot bind and rename past lines, with notice.
+        model.recordSpeakerCue(name: "Alex", slot: "Speaker 1")
+        try check(model.transcript.lines.last?.speaker == "Alex")
+        try check(model.lastAutoBinding != nil && model.notice.contains("Alex"))
+        // The mic speaker is never auto-renamed.
+        model.recordSpeakerCue(name: "Alex", slot: "You")
+        model.recordSpeakerCue(name: "Alex", slot: "You")
+        try check(model.lastAutoBinding?.slot == "Speaker 1")
+        // A conflicting name never overrides a bound slot.
+        model.recordSpeakerCue(name: "Jamie", slot: "Speaker 1")
+        model.recordSpeakerCue(name: "Jamie", slot: "Speaker 1")
+        try check(model.transcript.lines.last?.speaker == "Alex")
+        // Undo restores the slot label and clears the evidence so one stray cue does not rebind.
+        model.undoAutoBinding()
+        try check(model.transcript.lines.last?.speaker == "Speaker 1")
+        try check(model.lastAutoBinding == nil)
+        model.recordSpeakerCue(name: "Alex", slot: "Speaker 1")
+        try check(model.transcript.lines.last?.speaker == "Speaker 1")
+        model.recordSpeakerCue(name: "Alex", slot: "Speaker 1")
+        try check(model.transcript.lines.last?.speaker == "Alex")
         try await model.flush()
     }
     func decisionAndFollowUpActions() async throws {

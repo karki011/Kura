@@ -72,11 +72,11 @@ struct OnboardingView: View {
             why: "Apple's on-device speech recognition turns meeting audio into a live transcript.",
             promptLabel: "Allow speech recognition")
         case .accessibility: permissionStep(.accessibility,
-            why: "Recommended — hold-to-talk from any app without switching windows.",
+            why: "Recommended — hold-to-talk from any app, and reading speaker names from your meeting app without screenshots.",
             promptLabel: "Open Accessibility settings",
             optional: true, guide: true)
         case .screenAudio: permissionStep(.screenRecording,
-            why: "Lets Kura hear meeting audio and, optionally, observe a meeting window. macOS may ask you to quit and reopen Kura afterwards — that's normal.",
+            why: "Lets Kura hear meeting audio and, optionally, observe a meeting window as a fallback for name cues. macOS may ask you to quit and reopen Kura afterwards — that's normal.",
             promptLabel: "Open Screen & System Audio settings",
             optional: true, guide: true)
         case .done: done
