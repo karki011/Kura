@@ -268,42 +268,29 @@ private struct ConversationView: View {
     @Binding var target: UUID?
     var onEdit: (TranscriptLine) -> Void
     var onAsk: (String) -> Void
-    @State private var follow = true
     @State private var visibleCount = 150
-    @State private var viewportHeight: CGFloat = 0
     var body: some View {
-        GeometryReader { outer in
-            ScrollViewReader { proxy in
-                ZStack(alignment: .bottomTrailing) {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 16) {
-                            if lines.count > visibleCount { Button("Load earlier conversation") { follow = false; visibleCount += 150 } }
-                            ForEach(lines.suffix(visibleCount)) { line in
-                                TranscriptRow(line: line, onEdit: { onEdit(line) }, onAsk: { onAsk(line.text) }).equatable().id(line.id)
-                            }
-                            GeometryReader { geo in Color.clear.preference(key: BottomPosition.self, value: geo.frame(in: .named("conversation")).maxY) }.frame(height: 1).id("bottom")
-                        }.padding(18)
-                    }.coordinateSpace(name: "conversation")
-                        .onPreferenceChange(BottomPosition.self) { bottom in follow = bottom < outer.size.height + 70 }
-                    if !follow {
-                        Button("Jump to latest", systemImage: "arrow.down") { follow = true; proxy.scrollTo("bottom", anchor: .bottom) }
-                            .buttonStyle(.borderedProminent).controlSize(.small).padding(14)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    if lines.count > visibleCount { Button("Load earlier conversation") { visibleCount += 150 } }
+                    ForEach(lines.suffix(visibleCount)) { line in
+                        TranscriptRow(line: line, onEdit: { onEdit(line) }, onAsk: { onAsk(line.text) }).equatable().id(line.id)
                     }
-                }
-                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
-                .onChange(of: lines.last) { if follow { proxy.scrollTo("bottom", anchor: .bottom) } }
-                .onChange(of: target) {
-                    guard let id = target else { return }
-                    visibleCount = lines.count; follow = false
-                    Task { @MainActor in await Task.yield(); proxy.scrollTo(id, anchor: .center); target = nil }
-                }
+                    Color.clear.frame(height: 1).id("bottom")
+                }.padding(18)
+            }
+            // Messages-style following: stays pinned to the latest line as it
+            // arrives or grows; scrolling up releases, scrolling back re-engages.
+            .defaultScrollAnchor(.bottom)
+            .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+            .onChange(of: target) {
+                guard let id = target else { return }
+                visibleCount = lines.count
+                Task { @MainActor in await Task.yield(); proxy.scrollTo(id, anchor: .center); target = nil }
             }
         }
     }
-}
-private struct BottomPosition: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 private struct TranscriptRow: View, Equatable {
     let line: TranscriptLine
