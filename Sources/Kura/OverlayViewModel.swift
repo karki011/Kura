@@ -392,10 +392,13 @@ final class OverlayViewModel: ObservableObject {
             guard let self else { return }
             defer { if self.pendingAnswerID == pending { self.autoAnswerStatus = ""; self.qaDebounce = nil } }
             // Keep only the latest pending question; never interrupt a typed answer.
-            let deadline = ProcessInfo.processInfo.systemUptime + 15
+            // A still-streaming AUTO answer is stale once a newer question arrives —
+            // stop it and answer the new one instead of waiting.
+            let deadline = ProcessInfo.processInfo.systemUptime + 30
             while self.status == .streaming {
                 guard self.pendingAnswerID == pending, self.autoQA, self.selected == nil,
                       self.alwaysOnActive, self.session.id == target else { return }
+                if self.requestIsAuto { self.interruptAutoAnswer(); break }
                 guard ProcessInfo.processInfo.systemUptime < deadline else {
                     self.notice = "Auto answer waited for the current reply. Ask the missed question in the message box."
                     return
@@ -411,6 +414,16 @@ final class OverlayViewModel: ObservableObject {
     }
     private func cancelPendingAnswer() {
         pendingAnswerID = UUID(); qaDebounce?.cancel(); qaDebounce = nil; autoAnswerStatus = ""
+    }
+    // A newer spoken question replaces a still-streaming auto answer. Unlike
+    // stopAnswer() this must not cancel the pending-answer task that calls it.
+    private func interruptAutoAnswer() {
+        streamTask?.cancel(); requestID = UUID()
+        if let id = activeLineID, let target = activeTargetID {
+            updateLine(id, target: target) { if $0.text.isEmpty { $0.text = "Skipped for a newer question" }; $0.isFinal = true }
+        }
+        activeLineID = nil; activeTargetID = nil; streamTask = nil; requestIsAuto = false; progress = ""
+        if status == .streaming { status = .idle }
     }
     private var titleAttempts = 0
     // One-shot: name the meeting from its opening conversation unless the user already did.

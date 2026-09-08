@@ -49,6 +49,7 @@ struct WorkspaceTests {
             ("shortPauseRequiresStableTextAndLiveQuietAudio", { try suite.shortPauseRequiresStableTextAndLiveQuietAudio() }),
             ("conversationalTurnAnswersOnceAndAllowsFollowUp", { try await suite.conversationalTurnAnswersOnceAndAllowsFollowUp() }),
             ("busyAutoAnswerKeepsLatestQuestion", { try await suite.busyAutoAnswerKeepsLatestQuestion() }),
+            ("newerQuestionInterruptsStaleAutoAnswer", { try await suite.newerQuestionInterruptsStaleAutoAnswer() }),
             ("pendingAutoAnswerCancelsWhenDisabledOrPaused", { try await suite.pendingAutoAnswerCancelsWhenDisabledOrPaused() }),
             ("spokenQuestionDetection", { try suite.spokenQuestionDetection() }),
             ("spokenQuestionLLMFallback", { try await suite.spokenQuestionLLMFallback() }),
@@ -242,6 +243,22 @@ struct WorkspaceTests {
         try check(provider.callCount == 2)
         try check(provider.messages.first?.content.contains("Request:\nAnswer this spoken question briefly: Who sends the brief") == true)
         model.stopAnswer(); model.alwaysOnActive = false; try await model.flush()
+    }
+    func newerQuestionInterruptsStaleAutoAnswer() async throws {
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider(); provider.suspended = true
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let original = model.autoQA; defer { model.autoQA = original }
+        model.autoQA = true; model.alwaysOnActive = true
+        model.transcript.appendFinal("What is earth", speaker: "Alex")
+        try await Task.sleep(for: .milliseconds(500))
+        try check(provider.callCount == 1 && model.status == .streaming)
+        model.transcript.appendFinal("What is the moon", speaker: "Alex")
+        try await Task.sleep(for: .milliseconds(700))
+        try check(provider.callCount == 2)
+        try check(provider.messages.first?.content.contains("moon") == true)
+        model.stopAnswer()
+        try await model.flush()
     }
     func pendingAutoAnswerCancelsWhenDisabledOrPaused() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
