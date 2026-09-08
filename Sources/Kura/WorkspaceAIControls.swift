@@ -20,7 +20,7 @@ struct WorkspaceAIControls: View {
     @AppStorage("anthropicModel") private var claudeModel = "claude-sonnet-4-5"
     @AppStorage("anthropicEffort") private var claudeEffort = "default"
     @AppStorage("directOpenAIModel") private var openAIModel = "gpt-5-mini"
-    @AppStorage("directOpenAIEffort") private var openAIEffort = "default"
+    @AppStorage("directOpenAIEffort") private var openAIEffort = "low"
     @AppStorage("openAIModel") private var customModel = "gpt-5-mini"
     @AppStorage("reasoningEffort") private var customEffort = "none"
     @AppStorage("ollamaModel") private var localModel = "llama3.2"

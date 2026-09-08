@@ -372,7 +372,7 @@ final class OverlayViewModel: ObservableObject {
             var verdict = ""
             do {
                 let ask = LLMMessage(role: "user", content: "In this meeting transcript line, did the speaker ask a question or make a request an AI assistant should answer? Reply only yes or no.\n\n\(line.text)")
-                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [ask], system: "You classify meeting transcript lines. Reply only yes or no."), within: 5)
+                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [ask], system: "You classify meeting transcript lines. Reply only yes or no."), within: self.firstTokenWindow())
                 for try await delta in stream { verdict += delta }
             } catch { return }
             guard verdict.lowercased().contains("yes") else { return }
@@ -411,6 +411,13 @@ final class OverlayViewModel: ObservableObject {
             self.answeredLines.insert(line.id)
             self.request("Answer this spoken question briefly: \(line.text)", display: "Auto answer", automatic: true)
         }
+    }
+    // Reasoning effort above "low" thinks before it speaks, so a 5s first-token
+    // window would kill healthy requests; fast modes must still meet the 5s bar.
+    private func firstTokenWindow() -> Double {
+        guard ProviderKind(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") == .openAI else { return 8 }
+        let effort = UserDefaults.standard.string(forKey: "directOpenAIEffort") ?? "low"
+        return ["none", "minimal", "low"].contains(effort) ? 5 : 20
     }
     private func cancelPendingAnswer() {
         pendingAnswerID = UUID(); qaDebounce?.cancel(); qaDebounce = nil; autoAnswerStatus = ""
@@ -473,7 +480,7 @@ final class OverlayViewModel: ObservableObject {
             while true {
                 attempt += 1
                 do {
-                    let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: messages, system: systemPrompt), within: 5)
+                    let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: messages, system: systemPrompt), within: self.firstTokenWindow())
                     for try await delta in stream {
                         try Task.checkCancellation(); guard self.requestID == token else { return }
                         pending += delta; full += delta
@@ -493,7 +500,7 @@ final class OverlayViewModel: ObservableObject {
                     // A stall before any text is retryable once; a failed retry or a
                     // mid-answer failure keeps whatever text already arrived.
                     if full.isEmpty && attempt < 2 && !Task.isCancelled {
-                        self.notice = "No response in 5s — retrying…"
+                        self.notice = "No response — retrying…"
                         continue
                     }
                     self.updateLine(line.id, target: snapshot.id) {

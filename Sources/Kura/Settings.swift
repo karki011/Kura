@@ -67,7 +67,9 @@ struct SettingsStore: Sendable {
                 AnthropicProvider(apiKey: key, model: model, effort: effort, adaptiveThinking: adaptive, tokenLimit: limit)
             }
         case .openAI:
-            let model = activeModel, effort = defaults.string(forKey: "directOpenAIEffort") ?? "default", limit = answerTokenLimit
+            // Effort above "low" reasons before speaking and cannot meet the 5s
+            // first-token bar; default to low. Users can still opt into more.
+            let model = activeModel, effort = defaults.string(forKey: "directOpenAIEffort") ?? "low", limit = answerTokenLimit
             let fast = defaults.object(forKey: "openAIFastMode") as? Bool ?? true
             return KeychainBackedProvider(account: "openai-direct") { key in
                 OpenAIResponsesProvider(apiKey: key, model: model, effort: effort, tokenLimit: limit, fastMode: fast)
