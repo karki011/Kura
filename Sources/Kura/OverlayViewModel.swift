@@ -92,6 +92,7 @@ final class OverlayViewModel: ObservableObject {
     private var audioEpoch = UUID()
     private var speakerNames: [String: String] = [:]
     private var captureStopTask: Task<Void, Never>?
+    private var modelPrepareTask: Task<Void, Never>?
     private var previewCaptureTask: Task<Void, Never>?
     private var captureHealthTask: Task<Void, Never>?
     private var lastAudibleAudio = Date.distantPast
@@ -286,8 +287,8 @@ final class OverlayViewModel: ObservableObject {
             }
             return
         }
-        let useLocal = UserDefaults.standard.string(forKey: "transcriptionBackend") == "local"
-        if !useLocal {
+        let engine = TranscriptionEngine.saved
+        if engine == .apple {
             let permissions = PermissionManager.shared
             permissions.refresh()
             guard permissions.isGranted(.speech) else {
@@ -296,8 +297,6 @@ final class OverlayViewModel: ObservableObject {
                 return
             }
         }
-        let local = useLocal ? LocalSpeechConfiguration.saved : nil
-        do { try local?.validate() } catch { lastError = error.localizedDescription; return }
         lastError = ""; audioEpoch = UUID(); let epoch = audioEpoch
         let captureStarted = Date(); captureStartedAt = captureStarted
         let labels = session.lines.filter { $0.source == "speech" && $0.speaker != "You" }.map(\.speaker) + Array(speakerNames.keys)
@@ -316,7 +315,7 @@ final class OverlayViewModel: ObservableObject {
         }
         screenAudio.onLevel = { [weak self] level in
             guard let self, self.audioEpoch == epoch, self.alwaysOnActive else { return }
-            self.audioLevel = level; self.captureStatus = useLocal ? "Listening · local transcript every ~10s + processing" : "Listening"
+            self.audioLevel = level; self.captureStatus = engine == .fluid ? "Listening · on-device speaker labels" : "Listening"
             if level > 0.005 {
                 self.lastAudibleAudio = Date()
                 if self.notice.hasPrefix("No audible system audio detected.") { self.notice = "" }
@@ -326,9 +325,35 @@ final class OverlayViewModel: ObservableObject {
             guard let self, self.audioEpoch == epoch, self.alwaysOnActive else { return }
             self.lastError = error; self.stopCapture()
         }
-        alwaysOnActive = true; captureStatus = "Connecting audio…"
+        alwaysOnActive = true; captureStatus = engine == .fluid ? "Preparing on-device speech…" : "Connecting audio…"
         session.endedAt = nil
-        screenAudio.start(localConfiguration: local)
+        if engine == .fluid {
+            // First use downloads the CoreML models; capture starts once they are ready.
+            modelPrepareTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await FluidSpeechEngine.shared.prepare { fraction, stage in
+                        Task { @MainActor in
+                            guard self.audioEpoch == epoch, self.alwaysOnActive else { return }
+                            let percent = Int((fraction * 100).rounded())
+                            self.captureStatus = fraction >= 1 ? "Connecting audio…" : "\(stage) · \(percent)%"
+                        }
+                    }
+                    guard self.audioEpoch == epoch, self.alwaysOnActive else { return }
+                    self.captureStatus = "Connecting audio…"
+                    self.screenAudio.start(engine: .fluid)
+                    // The tap delivers no callbacks while the system is silent, so the level
+                    // meter (which otherwise owns this status) may not fire for a while.
+                    self.captureStatus = "Listening · on-device speaker labels"
+                } catch {
+                    guard self.audioEpoch == epoch, self.alwaysOnActive, !Task.isCancelled else { return }
+                    self.lastError = "On-device speech setup failed: \(error.localizedDescription)"
+                    self.stopCapture()
+                }
+            }
+        } else {
+            screenAudio.start(engine: .apple)
+        }
         lastAudibleAudio = Date()
         captureHealthTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -346,6 +371,7 @@ final class OverlayViewModel: ObservableObject {
     func stopCapture() {
         guard captureStopTask == nil else { return }
         alwaysOnActive = false
+        modelPrepareTask?.cancel(); modelPrepareTask = nil
         previewCaptureTask?.cancel(); previewCaptureTask = nil
         captureHealthTask?.cancel(); captureHealthTask = nil
         ownSpeech.stop(); ownVoiceActive = false

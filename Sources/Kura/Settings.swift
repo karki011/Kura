@@ -152,17 +152,22 @@ struct SettingsView: View {
                     Text("Cloak compatibility · original capture").tag("cloak")
                 }
                 Text("For troubleshooting missing audio. Pause Listen before switching; the next Listen uses the selected capture method. Neither method changes your AI provider or requires a paid speech service.").font(.caption).foregroundStyle(.secondary)
-                Picker("Transcription", selection: $transcriptionBackend) {
-                    Text("Apple · live text, no speaker separation").tag("apple")
-                    Text("Local · Whisper + pyannote").tag("local")
+                Picker("Listen with", selection: $transcriptionBackend) {
+                    Text("Apple Speech (default)").tag("apple")
+                    Text("On-device · speaker labels").tag("fluid")
                 }
-                Text("Both options have no paid speech API requirement. Changes apply the next time you start Listen. Apple may use its servers when on-device recognition is unavailable.")
+                Text("Both options are free with no speech API account. Changes apply the next time you start Listen. Apple may use its servers when on-device recognition is unavailable; the on-device option never sends audio anywhere.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Listen shows the transcript. Auto answer responds to detected questions after a short pause. Apple uses about 1.2 seconds of stable text and 0.9 seconds of quiet audio before sending; your AI provider adds its response time. Local transcription also needs chunk processing time. You can type a question anytime.").font(.caption).foregroundStyle(.secondary)
+                Text("Listen shows the transcript. Auto answer responds to detected questions after a short pause. Apple uses about 1.2 seconds of stable text and 0.9 seconds of quiet audio before sending; your AI provider adds its response time. You can type a question anytime.").font(.caption).foregroundStyle(.secondary)
             }
-            if transcriptionBackend == "local" {
-                LocalSpeechSetupView()
-                Text("Local text and speaker labels appear every ~10 seconds plus processing time. Names are tentative; returning speakers may need relabeling after a long pause. Audio windows are stored temporarily on this Mac and deleted after processing.").font(.caption).foregroundStyle(.secondary)
+            if transcriptionBackend == "fluid" {
+                WorkspaceSection("On-device speech models") {
+                    Text("Parakeet streaming transcription (English) and Sortformer speaker separation run as CoreML models on the Apple Neural Engine via FluidAudio. Up to 4 remote speakers get live labels; names are tentative and you can rename them in the transcript.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("First use downloads the models once (a few hundred MB from Hugging Face) while Listen waits with progress. After that, everything works offline.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("On-device speech notes") { NSWorkspace.shared.open(LocalSpeechConfiguration.resource("LOCAL_SPEECH_SETUP.md")) }
+                }
             }
             }
             if settingsTab == "AI setup" {
@@ -305,6 +310,8 @@ struct SettingsView: View {
         .modifier(KuraAppearance())
         .onAppear {
             if provider == .ollama { refreshOllamaModels() }
+            // The retired Python pipeline stored "local"; it now maps to the on-device engine.
+            if transcriptionBackend == "local" { transcriptionBackend = "fluid" }
         }
         .onChange(of: providerRaw) { _, _ in
             cancelConnectionTest()

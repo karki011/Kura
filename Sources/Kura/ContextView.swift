@@ -52,7 +52,6 @@ struct AttachmentPreview: View {
 struct CaptureSetupView: View {
     @ObservedObject var model: OverlayViewModel
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("transcriptionBackend") private var transcriptionBackend = "apple"
     @AppStorage("includeMicrophone") private var includeMicrophone = false
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -62,8 +61,8 @@ struct CaptureSetupView: View {
             Text("Applies when you start listening. Your microphone uses Apple speech recognition. A headset helps prevent remote voices being captured twice.").font(.caption).foregroundStyle(.secondary)
             GroupBox("Speaker labels") {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(transcriptionBackend == "local" ? "Whisper + pyannote · local" : "Apple transcription · unnamed remote speakers").font(.headline)
-                    Text(transcriptionBackend == "local" ? "Remote voices get tentative labels in rolling audio windows. Names need confirmation; long pauses may start a new label. Processing adds delay." : "Apple transcription does not separate remote voices. Set up the free local Whisper + pyannote option in Settings for speaker labels.").font(.caption).foregroundStyle(.secondary)
+                    Text(TranscriptionEngine.saved == .fluid ? "On-device · live speaker labels" : "Apple Speech · unnamed remote speakers").font(.headline)
+                    Text(TranscriptionEngine.saved == .fluid ? "Remote voices get tentative live labels from on-device models (up to 4 speakers). Names need confirmation; you can rename speakers in the transcript." : "Apple Speech does not separate remote voices. Choose the on-device speaker labels option in Settings for live labels.").font(.caption).foregroundStyle(.secondary)
                     Button("Transcription settings…") {
                         UserDefaults.standard.set("Audio", forKey: "settingsTab")
                         NotificationCenter.default.post(name: .kuraOpenSettings, object: nil)

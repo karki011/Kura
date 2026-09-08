@@ -26,8 +26,7 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     var onError: (@MainActor (String) -> Void)?
     var onSpeakerTranscript: (@MainActor (SpeakerSegment) -> Void)?
     var onLevel: (@MainActor (Double) -> Void)?
-    private var localConfiguration: LocalSpeechConfiguration?
-    private var localSpeech: LocalSpeechStream?
+    private var engine: TranscriptionEngine = .apple
     private var lastLevelTime = Date.distantPast
 
     private let queue = DispatchQueue(label: "kura.screenaudio")
@@ -61,10 +60,10 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
 
     // MARK: Lifecycle
 
-    func start(localConfiguration: LocalSpeechConfiguration? = nil) {
+    func start(engine: TranscriptionEngine = .apple) {
         queue.async { [self] in
             guard !running else { return }
-            self.localConfiguration = localConfiguration
+            self.engine = engine
             CaptureDiagnostics.shared.reset()
             CaptureDiagnostics.shared.stage("Creating system audio tap")
             running = true
@@ -77,14 +76,15 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     }
 
     func stopAndDrain() async {
-        await withCheckedContinuation { continuation in
+        let wasFluid: Bool = await withCheckedContinuation { continuation in
             queue.async { [self] in
-                let client = localSpeech; localSpeech = nil
-                teardownLocked()
-                if let client { client.stop { continuation.resume() } }
-                else { continuation.resume() }
+                let wasFluid = engine == .fluid
+                teardownLocked(drainFluid: false)
+                continuation.resume(returning: wasFluid)
             }
         }
+        // Awaited so the final utterance lands before the caller closes open lines.
+        if wasFluid { await FluidSpeechEngine.shared.finishSession() }
     }
 
     private func setupCaptureLocked() {
@@ -194,7 +194,11 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
             NSLog("[screenaudio] capture started (process tap)")
             }
 
-            if localConfiguration != nil { CaptureDiagnostics.shared.stage("Waiting for audio · local speech"); return }
+            if engine == .fluid {
+                CaptureDiagnostics.shared.stage("Waiting for audio · on-device speech")
+                startFluidSessionLocked()
+                return
+            }
             CaptureDiagnostics.shared.stage("Checking Apple speech authorization")
 
             // Recognition starts once speech is authorized; capture already runs.
@@ -279,9 +283,11 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         try engine.start()
     }
 
-    private func teardownLocked() {
+    private func teardownLocked(drainFluid: Bool = true) {
         commitLastLocked()
-        localSpeech?.stop(); localSpeech = nil
+        if engine == .fluid, drainFluid {
+            Task { await FluidSpeechEngine.shared.finishSession() }
+        }
         running = false
         CaptureDiagnostics.shared.stage("Stopping audio device")
         lifecycle.stop()
@@ -313,6 +319,41 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         }
         NSLog("[screenaudio] capture stopped")
         CaptureDiagnostics.shared.stage("Stopped")
+    }
+
+    // MARK: On-device engine (FluidAudio)
+
+    /// The Fluid engine needs no speech authorization; its session starts once capture is up.
+    /// Models are expected to be prepared by the caller (OverlayViewModel) beforehand.
+    private func startFluidSessionLocked() {
+        let segmentCB = onSpeakerTranscript
+        let partialCB = onTranscript
+        let captureGeneration = lifecycle.capture
+        NSLog("[screenaudio] fluid session start requested")
+        Task { [self] in
+            await FluidSpeechEngine.shared.setHandlers(
+                onSegment: { segment in Task { @MainActor in segmentCB?(segment) } },
+                onPartial: { text in Task { @MainActor in partialCB?(text, false) } },
+                onError: { message in
+                    Task { [self] in
+                        queue.async { [self] in
+                            guard running, lifecycle.acceptsAudio(captureGeneration) else { return }
+                            reportError(message)
+                        }
+                    }
+                })
+            do {
+                try await FluidSpeechEngine.shared.startSession()
+                CaptureDiagnostics.shared.stage("On-device speech running")
+            } catch {
+                let message = error.localizedDescription
+                queue.async { [self] in
+                    guard running, lifecycle.acceptsAudio(captureGeneration) else { return }
+                    reportError("On-device speech failed to start: \(message)")
+                    teardownLocked()
+                }
+            }
+        }
     }
 
     // MARK: Recognition with rotation (all on `queue`)
@@ -431,10 +472,10 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     }
 
     private func processBufferLocked(_ buffer: AVAudioPCMBuffer) {
-        guard let channels = buffer.floatChannelData else { request?.append(buffer); return }
+        guard let channels = buffer.floatChannelData else { routeLocked(buffer); return }
         let count = Int(buffer.frameLength); let channelCount = Int(buffer.format.channelCount)
         guard count > 0, channelCount > 0 else { return }
-        var mono = [Int16](repeating: 0, count: count); var energy = 0.0
+        var energy = 0.0
         for frame in 0..<count {
             var value: Float = 0
             for channel in 0..<channelCount {
@@ -442,7 +483,6 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
             }
             value /= Float(channelCount)
             energy += Double(value * value)
-            mono[frame] = Int16(max(-32767, min(32767, value * 32767)))
         }
         if Date().timeIntervalSince(lastLevelTime) > 0.15 {
             lastLevelTime = Date(); let level = min(1, sqrt(energy / Double(count)) * 5); let cb = onLevel
@@ -451,16 +491,13 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         let rms = sqrt(energy / Double(count))
         turnBoundary.observe(rms: rms, at: ProcessInfo.processInfo.systemUptime)
         CaptureDiagnostics.shared.buffer(level: rms)
-        if let configuration = localConfiguration {
-            if localSpeech == nil {
-                let segmentCB = onSpeakerTranscript; let errorCB = onError
-                do {
-                    localSpeech = try LocalSpeechStream(configuration: configuration, sampleRate: buffer.format.sampleRate, onSegments: { segments in
-                        Task { @MainActor in for segment in segments { segmentCB?(segment) } }
-                    }, onError: { error in Task { await errorCB?(error) } })
-                } catch { reportError(error.localizedDescription); teardownLocked(); return }
-            }
-            localSpeech?.send(mono.withUnsafeBytes { Data($0) })
+        routeLocked(buffer)
+    }
+
+    private func routeLocked(_ buffer: AVAudioPCMBuffer) {
+        if engine == .fluid {
+            let boxed = SendableAudioBuffer(buffer)
+            Task { await FluidSpeechEngine.shared.append(boxed) }
         } else { request?.append(buffer) }
     }
 
