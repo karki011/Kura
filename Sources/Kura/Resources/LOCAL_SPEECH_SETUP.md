@@ -1,17 +1,18 @@
 # On-device transcription + speaker labels
 
 Kura's **On-device · speaker labels** option (Settings → Audio → Listen with) transcribes
-system audio entirely on your Mac and labels up to 4 remote speakers live. It replaces the
-earlier do-it-yourself whisper.cpp + pyannote setup; no Python, command-line tools, model
-accounts, or manual downloads are needed.
+system audio entirely on your Mac and labels remote speakers live (up to 10 by default).
+It replaces the earlier do-it-yourself whisper.cpp + pyannote setup; no Python,
+command-line tools, model accounts, or manual downloads are needed.
 
 ## What runs
 
 - **Parakeet EOU 120M** streaming speech recognition (English), and
-- **Sortformer v2.1** streaming speaker separation,
+- **LS-EEND** (default, up to 10 speakers) or **Sortformer v2.1** (max 4, steadier
+  identities) streaming speaker separation — pick in Settings → Audio,
 
-both as CoreML models on the Apple Neural Engine, integrated through FluidAudio
-(https://github.com/FluidInference/FluidAudio, Apache-2.0).
+as CoreML models (ASR on the Apple Neural Engine, diarization CPU-optimized), integrated
+through FluidAudio (https://github.com/FluidInference/FluidAudio, Apache-2.0).
 
 ## First use
 
@@ -28,9 +29,10 @@ download on next use.
 
 - Text streams live and each utterance is committed with its speaker label a moment
   after the speaker pauses (roughly 1–2 seconds).
-- Speaker labels (Speaker 1–4) are stable within a listening session and tentative:
+- Speaker labels are stable within a listening session and tentative:
   confirm or rename them in the transcript. A brand-new session starts numbering over.
-- Sortformer supports at most 4 simultaneous speakers; beyond that, voices may be merged.
+  With the default LS-EEND backend, up to 10 speakers are tracked; the Sortformer
+  option caps at 4 but keeps returning voices mapped more steadily.
 - No audio ever leaves the Mac. A cloud answer provider still receives the transcript
   text used for Q&A, per your AI setup.
 - The system audio tap only delivers audio while sound is actually playing; in silence
@@ -43,4 +45,5 @@ download on next use.
 
 - FluidAudio: https://github.com/FluidInference/FluidAudio (Apache-2.0)
 - Parakeet EOU: NVIDIA parakeet_realtime_eou_120m-v1, CoreML conversion by FluidInference
+- LS-EEND: https://arxiv.org/abs/2406.02842 (Long-form streaming EEND diarization)
 - Sortformer: https://arxiv.org/abs/2409.06656 (NVIDIA Open Model License)

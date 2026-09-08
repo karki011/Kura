@@ -112,6 +112,7 @@ struct SettingsView: View {
     @State private var ollamaModels: [String] = []
     @State private var ollamaStatus = ""
     @AppStorage("transcriptionBackend") private var transcriptionBackend = "apple"
+    @AppStorage("diarizerBackend") private var diarizerBackend = "eend"
     @AppStorage("systemAudioCaptureDriver") private var captureDriver = "direct"
 
     private var provider: ProviderKind {
@@ -162,7 +163,11 @@ struct SettingsView: View {
             }
             if transcriptionBackend == "fluid" {
                 WorkspaceSection("On-device speech models") {
-                    Text("Parakeet streaming transcription (English) and Sortformer speaker separation run as CoreML models on the Apple Neural Engine via FluidAudio. Up to 4 remote speakers get live labels; names are tentative and you can rename them in the transcript.")
+                    Picker("Speaker separation", selection: $diarizerBackend) {
+                        Text("Up to 10 speakers (default)").tag("eend")
+                        Text("Most stable · max 4").tag("sortformer")
+                    }
+                    Text("Parakeet streaming transcription (English) and LS-EEND or Sortformer speaker separation run as on-device CoreML models via FluidAudio. Speaker labels are tentative; you can rename them in the transcript. The separation choice applies the next time you start Listen; its model downloads once if needed.")
                         .font(.callout).foregroundStyle(.secondary)
                     Text("First use downloads the models once (a few hundred MB from Hugging Face) while Listen waits with progress. After that, everything works offline.")
                         .font(.caption).foregroundStyle(.secondary)

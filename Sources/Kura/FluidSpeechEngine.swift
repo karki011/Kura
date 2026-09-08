@@ -1,7 +1,7 @@
 // FluidSpeechEngine — fully on-device transcription with live speaker labels via FluidAudio
-// (Parakeet EOU 120M streaming ASR + Sortformer v2.1 streaming diarization, CoreML on the ANE).
+// (Parakeet EOU 120M streaming ASR on the ANE + LS-EEND or Sortformer streaming diarization).
 // Replaces the Python whisper.cpp/pyannote pipeline: models download from Hugging Face on
-// first use and run offline afterwards. Speaker indices are Sortformer's session-stable slots.
+// first use and run offline afterwards. Speaker indices are session-stable 0-based slots.
 import AVFoundation
 import Foundation
 
@@ -12,6 +12,16 @@ enum TranscriptionEngine: String {
     static var saved: TranscriptionEngine {
         let raw = UserDefaults.standard.string(forKey: "transcriptionBackend") ?? "apple"
         return raw == "apple" ? .apple : .fluid
+    }
+}
+
+/// Which streaming diarizer labels speakers. Persisted as "diarizerBackend".
+/// LS-EEND handles up to 10 speakers and is FluidAudio's default online diarizer;
+/// Sortformer is capped at 4 but keeps identities steadier within a session.
+enum DiarizerBackend: String {
+    case eend, sortformer
+    static var saved: DiarizerBackend {
+        DiarizerBackend(rawValue: UserDefaults.standard.string(forKey: "diarizerBackend") ?? "") ?? .eend
     }
 }
 
@@ -28,19 +38,30 @@ actor FluidSpeechEngine {
     static let shared = FluidSpeechEngine()
 
     private static let chunkSize: StreamingChunkSize = .ms320
-    private static let diarizerConfig: SortformerConfig = .balancedV2_1
+    private static let sortformerConfig: SortformerConfig = .balancedV2_1
+    private static let eendVariant: LSEENDVariant = .dihard3
     private let eouDebounceMs = 1280
 
+    /// A downloaded+loaded diarizer model set, tagged with the backend it belongs to.
+    private enum LoadedDiarizerModel {
+        case sortformer(SortformerModels)
+        case eend(LSEENDModel)
+    }
+
     private var asr: StreamingEouAsrManager?
-    private var diarizerModels: SortformerModels?
-    private var diarizer: SortformerDiarizer?
+    private var loadedDiarizer: (backend: DiarizerBackend, model: LoadedDiarizerModel)?
+    private var diarizer: (any Diarizer)?
 
     private var prepareRunning = false
     private var prepareWaiters: [CheckedContinuation<Void, Error>] = []
     private var sessionActive = false
     private var failed = false
-    private var emittedTranscript = ""
+    /// Accumulated transcript of the current ASR epoch that has already been emitted.
+    private var emittedInEpoch = ""
     private var emittedTokenCount = 0
+    /// Session time (ms) where the current ASR epoch started; token timestamps are
+    /// epoch-relative and restart at zero each time the ASR resets after an EOU.
+    private var tokenEpochMs = 0
     private var utteranceStartMs = 0
     private var pending: [Float] = []
     private var pendingRate: Double = 16000
@@ -56,26 +77,40 @@ actor FluidSpeechEngine {
         self.onSegment = onSegment; self.onPartial = onPartial; self.onError = onError
     }
 
-    /// Downloads (first run only) and loads both model sets. Concurrent callers wait for the
-    /// same prepare. `progress` receives (fraction 0…1, stage label) from download threads.
+    /// Downloads (first run only) and loads the ASR models plus the selected diarizer's model.
+    /// Concurrent callers wait for the same prepare. `progress` receives (fraction 0…1, stage label).
+    /// LS-EEND's loader does not report download progress, so its phase only emits endpoints.
     func prepare(progress: @escaping @Sendable (Double, String) -> Void) async throws {
-        if asr != nil, diarizerModels != nil { progress(1, "On-device speech ready"); return }
+        let backend = DiarizerBackend.saved
+        if asr != nil, loadedDiarizer?.backend == backend { progress(1, "On-device speech ready"); return }
         if prepareRunning {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in prepareWaiters.append(cont) }
             return
         }
         prepareRunning = true
         do {
-            progress(0.02, "Preparing speech recognition")
-            let manager = StreamingEouAsrManager(chunkSize: Self.chunkSize, eouDebounceMs: eouDebounceMs)
-            try await manager.loadModels(to: nil, configuration: nil) { p in
-                progress(0.02 + p.fractionCompleted * 0.48, "Downloading speech recognition")
+            if asr == nil {
+                progress(0.02, "Preparing speech recognition")
+                let manager = StreamingEouAsrManager(chunkSize: Self.chunkSize, eouDebounceMs: eouDebounceMs)
+                try await manager.loadModels(to: nil, configuration: nil) { p in
+                    progress(0.02 + p.fractionCompleted * 0.48, "Downloading speech recognition")
+                }
+                asr = manager
             }
             progress(0.5, "Preparing speaker separation")
-            let models = try await SortformerModels.loadFromHuggingFace(config: Self.diarizerConfig) { p in
-                progress(0.5 + p.fractionCompleted * 0.48, "Downloading speaker separation")
+            let model: LoadedDiarizerModel
+            switch backend {
+            case .sortformer:
+                model = .sortformer(try await SortformerModels.loadFromHuggingFace(config: Self.sortformerConfig) { p in
+                    progress(0.5 + p.fractionCompleted * 0.48, "Downloading speaker separation")
+                })
+            case .eend:
+                progress(0.5, "Downloading speaker separation")
+                // LS-EEND is CPU-optimized by design; keeping it off the ANE also avoids
+                // contending with the ASR models there.
+                model = .eend(try await LSEENDModel.loadFromHuggingFace(variant: Self.eendVariant, stepSize: .step100ms))
             }
-            asr = manager; diarizerModels = models
+            loadedDiarizer = (backend, model)
             prepareRunning = false
             let waiters = prepareWaiters; prepareWaiters = []
             for waiter in waiters { waiter.resume() }
@@ -91,7 +126,7 @@ actor FluidSpeechEngine {
     /// Starts a capture session. Requires a successful `prepare` first.
     func startSession() async throws {
         NSLog("[fluid] session start requested")
-        guard let asr, let diarizerModels else {
+        guard let asr, let loadedDiarizer else {
             throw KuraError.message("On-device speech models are not ready yet.")
         }
         await asr.reset()
@@ -103,10 +138,16 @@ actor FluidSpeechEngine {
             guard let self else { return }
             Task { await self.partialUpdated(transcript) }
         }
-        let diarizer = SortformerDiarizer(config: Self.diarizerConfig)
-        diarizer.initialize(models: diarizerModels)
-        self.diarizer = diarizer
-        emittedTranscript = ""; utteranceStartMs = 0; pending = []; emittedTokenCount = 0
+        switch loadedDiarizer.model {
+        case .sortformer(let models):
+            let sortformer = SortformerDiarizer(config: Self.sortformerConfig)
+            sortformer.initialize(models: models)
+            diarizer = sortformer
+        case .eend(let model):
+            diarizer = try LSEENDDiarizer(model: model)
+        }
+        NSLog("[fluid] diarizer: %@ (%d speaker slots)", loadedDiarizer.backend.rawValue, diarizer?.numSpeakers ?? 0)
+        emittedInEpoch = ""; utteranceStartMs = 0; pending = []; emittedTokenCount = 0; tokenEpochMs = 0
         failed = false; sessionActive = true; chunksProcessed = 0
         NSLog("[fluid] session running")
     }
@@ -174,32 +215,49 @@ actor FluidSpeechEngine {
         onError?(message)
     }
 
-    /// The EOU callback carries the whole session's accumulated transcript, so the new
+    /// The EOU callback carries the current epoch's accumulated transcript, so the new
     /// utterance is the diff against what was already emitted. Utterance bounds come from
-    /// the ASR's per-token timestamps (relative to session start), which are far more
-    /// accurate than the EOU confirmation time (that trails speech by the debounce window).
+    /// the ASR's per-token timestamps, which are far more accurate than the EOU
+    /// confirmation time (that trails speech by the debounce window).
+    ///
+    /// EOU latches per epoch — `eouDetected` blocks any further confirmation until
+    /// `reset()` — so each committed utterance ends the epoch: the ASR is reset and its
+    /// token timestamps restart at zero, tracked via `tokenEpochMs`.
     private func utteranceEnded(accumulated: String) async {
-        guard sessionActive, !failed else { return }
-        await emit(accumulated: accumulated)
+        guard sessionActive, !failed, let asr else { return }
+        // The callback's transcript snapshot lags: decoding continues through the debounce
+        // window and the tail chunk may still be buffered. Drain it (padding to a full
+        // chunk) so the commit carries the complete utterance before the epoch resets.
+        await asr.injectSilence(0.7)
+        try? await asr.processBufferedAudio()
+        let latest = await asr.getPartialTranscript()
+        await emit(accumulated: latest.isEmpty ? accumulated : latest)
+        let eouMs = await asr.getEouTimestampsMs().last ?? 0
+        await asr.reset()
+        tokenEpochMs += eouMs
+        emittedInEpoch = ""; emittedTokenCount = 0
     }
 
     private func emit(accumulated: String, tokenTimestamps: [Int]? = nil) async {
-        let fresh = accumulated.hasPrefix(emittedTranscript) ? String(accumulated.dropFirst(emittedTranscript.count)) : accumulated
+        let fresh = accumulated.hasPrefix(emittedInEpoch) ? String(accumulated.dropFirst(emittedInEpoch.count)) : accumulated
         let text = fresh.trimmingCharacters(in: .whitespacesAndNewlines)
-        defer { emittedTranscript = accumulated }
+        defer { emittedInEpoch = accumulated }
         guard !text.isEmpty else { return }
-        var startMs = utteranceStartMs
-        var endMs = utteranceStartMs
+        var startMs = max(utteranceStartMs, tokenEpochMs)
+        var endMs = startMs
         if let asr {
-            let timestamps: [Int]
-            if let tokenTimestamps { timestamps = tokenTimestamps }
-            else { timestamps = await asr.getTokenTimestampsMs() }
-            if timestamps.count > emittedTokenCount {
-                let newTokens = timestamps[emittedTokenCount...]
-                startMs = newTokens.first ?? startMs
-                endMs = (newTokens.last ?? startMs) + Self.chunkSize.durationMs
+            let raw: [Int]
+            if let tokenTimestamps { raw = tokenTimestamps }
+            else { raw = await asr.getTokenTimestampsMs() }
+            // Token counts can shrink at chunk seams (temporal dedup), so re-sync
+            // rather than assuming append-only growth.
+            let count = min(emittedTokenCount, raw.count)
+            if raw.count > count {
+                let newTokens = raw[count...]
+                startMs = newTokens.first.map { $0 + tokenEpochMs } ?? startMs
+                endMs = (newTokens.last.map { $0 + tokenEpochMs } ?? startMs) + Self.chunkSize.durationMs
             }
-            emittedTokenCount = timestamps.count
+            emittedTokenCount = raw.count
         }
         utteranceStartMs = endMs
         let startS = Double(startMs) / 1000
@@ -209,8 +267,8 @@ actor FluidSpeechEngine {
     }
 
     private func partialUpdated(_ accumulated: String) {
-        guard sessionActive, !failed, accumulated.hasPrefix(emittedTranscript) else { return }
-        let tail = String(accumulated.dropFirst(emittedTranscript.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sessionActive, !failed, accumulated.hasPrefix(emittedInEpoch) else { return }
+        let tail = String(accumulated.dropFirst(emittedInEpoch.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         if !tail.isEmpty { onPartial?(tail) }
     }
 

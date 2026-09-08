@@ -62,7 +62,7 @@ struct CaptureSetupView: View {
             GroupBox("Speaker labels") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(TranscriptionEngine.saved == .fluid ? "On-device · live speaker labels" : "Apple Speech · unnamed remote speakers").font(.headline)
-                    Text(TranscriptionEngine.saved == .fluid ? "Remote voices get tentative live labels from on-device models (up to 4 speakers). Names need confirmation; you can rename speakers in the transcript." : "Apple Speech does not separate remote voices. Choose the on-device speaker labels option in Settings for live labels.").font(.caption).foregroundStyle(.secondary)
+                    Text(TranscriptionEngine.saved == .fluid ? "Remote voices get tentative live labels from on-device models (up to 10 speakers, or 4 with the more stable option in Settings). Names need confirmation; you can rename speakers in the transcript." : "Apple Speech does not separate remote voices. Choose the on-device speaker labels option in Settings for live labels.").font(.caption).foregroundStyle(.secondary)
                     Button("Transcription settings…") {
                         UserDefaults.standard.set("Audio", forKey: "settingsTab")
                         NotificationCenter.default.post(name: .kuraOpenSettings, object: nil)
