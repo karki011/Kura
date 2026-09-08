@@ -8,7 +8,9 @@ struct KuraAppearance: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(.regularMaterial.opacity(opacity))
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.8))
+            // Scale the solid base with the slider too — a constant 0.8 fill
+            // made even the lowest setting look opaque.
+            .background(Color(nsColor: .windowBackgroundColor).opacity(opacity * 0.7))
             .tint(KuraStyle.accent)
             .preferredColorScheme(themeMode == "dark" ? .dark : themeMode == "light" ? .light : nil)
     }

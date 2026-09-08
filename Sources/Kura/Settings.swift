@@ -251,7 +251,7 @@ struct SettingsView: View {
                 .help("Auto follows your Mac’s appearance")
                 HStack {
                     Text("Overlay opacity")
-                    Slider(value: $overlayOpacity, in: 0.35...1.0)
+                    Slider(value: $overlayOpacity, in: 0.05...1.0)
                         .pointingHandCursor()
                     Text("\(Int(overlayOpacity * 100))%")
                         .font(.caption)
