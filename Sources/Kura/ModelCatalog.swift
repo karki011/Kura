@@ -56,6 +56,20 @@ enum ModelCatalog {
             if let cursor, !seen.insert(cursor).inserted { throw KuraError.message("Provider repeated a model-list page.") }
         } while cursor != nil
         var unique = Set<String>()
-        return models.filter { unique.insert($0.id).inserted }.sorted { $0.id < $1.id }
+        return models.filter { unique.insert($0.id).inserted && isTextModel($0.id, provider: provider) }.sorted { $0.id < $1.id }
+    }
+    // /v1/models lists embeddings, audio, image, and moderation endpoints that
+    // cannot answer chat requests; offering them breaks every answer silently.
+    static func isTextModel(_ id: String, provider: ProviderKind) -> Bool {
+        switch provider {
+        case .anthropic: return id.hasPrefix("claude")
+        case .openAICompatible, .ollama: return true
+        case .openAI:
+            let family = id.hasPrefix("gpt-") || id.hasPrefix("chatgpt-")
+                || id.hasPrefix("o1") || id.hasPrefix("o3") || id.hasPrefix("o4")
+            let nonChat = ["embed", "dall-e", "whisper", "tts", "audio", "realtime",
+                           "image", "moderation", "sora", "transcribe", "search", "computer-use"]
+            return family && !nonChat.contains { id.contains($0) }
+        }
     }
 }

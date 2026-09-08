@@ -136,11 +136,13 @@ final class OverlayViewModel: ObservableObject {
     private func scheduleSave() {
         guard !restoring else { return }
         guard saveTask == nil else { return }
-        saveStatus = "Saving…"
         saveTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(600))
                 guard let self, !Task.isCancelled else { return }
+                // Live capture saves constantly; only surface the flash when the
+                // user is editing between moments of silence.
+                if !self.alwaysOnActive { self.saveStatus = "Saving…" }
                 let snapshot = self.session
                 try await self.meetings.save(snapshot, draft: true)
                 if snapshot.endedAt != nil { try await self.meetings.save(snapshot) }
@@ -458,7 +460,10 @@ final class OverlayViewModel: ObservableObject {
                         self.notice = "No response in 5s — retrying…"
                         continue
                     }
-                    self.updateLine(line.id, target: snapshot.id) { $0.text = full.isEmpty ? "Answer interrupted" : full; $0.isFinal = true }
+                    self.updateLine(line.id, target: snapshot.id) {
+                        $0.text = full.isEmpty ? "Answer failed — \(String(error.localizedDescription.prefix(140)))" : full
+                        $0.isFinal = true
+                    }
                     self.lastError = error.localizedDescription; self.finishRequest(token)
                     return
                 }
