@@ -403,6 +403,10 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     private func recognitionEndedLocked(failed: Bool) {
         commitLastLocked()
         lifecycle.rotateRecognition()
+        // A task that reported failure is not necessarily dead. Without cancel it
+        // keeps firing error callbacks forever — observed as 28k errors/sec and a
+        // pegged CPU. rotateLocked already cancels; this path must too.
+        recognitionTask?.cancel()
         recognitionTask = nil
         request = nil
         consecutiveFailures = failed ? consecutiveFailures + 1 : 0
