@@ -26,8 +26,46 @@ struct SpeechTurnBoundary {
     }
 }
 
-enum SpokenQuestion {
-    static func matches(_ text: String) -> Bool {
+/// Apple Speech revises the whole cumulative transcript until rotation, so long
+/// monologues can silently rewrite what the user already read. Commit the stable
+/// head of the partial incrementally; only the tail stays open to revision.
+struct IncrementalTranscriptCommitter {
+    private var committedCount = 0
+    private var previous = ""
+
+    /// Returns a chunk to commit as final once enough stable text accumulates.
+    mutating func observe(_ text: String) -> String? {
+        defer { previous = text }
+        guard !previous.isEmpty else { return nil }
+        let stableCount = text.commonPrefix(with: previous).count
+        // Rare wholesale revision into committed territory: resync and move on.
+        if stableCount < committedCount { committedCount = stableCount }
+        guard stableCount - committedCount >= 120 else { return nil }
+        let head = String(text.prefix(stableCount))
+        // Cut at the last sentence end, else the last word boundary. Note:
+        // .backwards + .regularExpression does not find the last match, so walk forward.
+        var cut = head.endIndex
+        var lastSentence: Range<String.Index>?
+        var searchStart = head.startIndex
+        while let r = head.range(of: #"[.!?]["']?\s"#, options: .regularExpression, range: searchStart..<head.endIndex) {
+            lastSentence = r; searchStart = r.upperBound
+        }
+        if let lastSentence { cut = lastSentence.upperBound }
+        else if let r = head.rangeOfCharacter(from: .whitespaces, options: .backwards) { cut = r.lowerBound }
+        let chunk = String(head[..<cut]).dropFirst(committedCount).trimmingCharacters(in: .whitespaces)
+        guard chunk.count >= 80 else { return nil }
+        committedCount = head[..<cut].count
+        return chunk
+    }
+
+    /// The still-revisable tail the UI should show as the live partial.
+    func remainder(for text: String) -> String {
+        guard committedCount <= text.count else { return text }
+        return String(text.dropFirst(committedCount)).trimmingCharacters(in: .whitespaces)
+    }
+}
+
+enum SpokenQuestion {    static func matches(_ text: String) -> Bool {
         let value = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let words = value.split { !$0.isLetter && !$0.isNumber }
         guard words.count >= 3 else { return false }

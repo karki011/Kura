@@ -42,6 +42,7 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     private var lifecycle = AudioCaptureLifecycle()
     private var generation: Int { lifecycle.recognition }
     private var lastText = ""
+    private var committer = IncrementalTranscriptCommitter()
     private var turnBoundary = SpeechTurnBoundary()
     private var consecutiveFailures = 0
     private var loggedFirstBuffer = false
@@ -332,6 +333,7 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         req.shouldReportPartialResults = true
         request = req
         turnBoundary = SpeechTurnBoundary()
+        committer = IncrementalTranscriptCommitter()
         let recognitionStarted = ProcessInfo.processInfo.systemUptime
         let gen = generation
         recognitionTask = recognizer.recognitionTask(with: req) { @Sendable result, error in
@@ -347,9 +349,19 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
                 if !text.isEmpty {
                     CaptureDiagnostics.shared.recognitionResult()
                     lastText = text
-                    turnBoundary.observe(text: text, at: ProcessInfo.processInfo.systemUptime)
+                    // Commit the stable head incrementally; only the tail stays
+                    // open to Apple's revisions. One Task keeps commit-then-
+                    // partial ordering on the main actor.
+                    let chunk = committer.observe(text)
+                    let remainder = committer.remainder(for: text)
+                    turnBoundary.observe(text: remainder, at: ProcessInfo.processInfo.systemUptime)
                     let cb = onTranscript
-                    if !isFinal { Task { await cb?(text, false) } }
+                    if !isFinal || chunk != nil {
+                        Task { @MainActor in
+                            if let chunk { await cb?(chunk, true) }
+                            if !isFinal { await cb?(remainder, false) }
+                        }
+                    }
                 }
                 if failed || isFinal {
                     guard running else { return }
@@ -407,7 +419,8 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     }
 
     private func commitLastLocked() {
-        let text = lastText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The stable head was already committed incrementally; only the tail remains.
+        let text = committer.remainder(for: lastText).trimmingCharacters(in: .whitespacesAndNewlines)
         lastText = ""
         guard !text.isEmpty, let cb = onTranscript else { return }
         Task { await cb(text, true) }

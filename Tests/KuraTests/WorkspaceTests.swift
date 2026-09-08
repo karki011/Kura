@@ -67,6 +67,7 @@ struct WorkspaceTests {
             ("wrapUpPersistsStructuredTasks", { try await suite.wrapUpPersistsStructuredTasks() }),
             ("continuousUpdatesStillAutosave", { try await suite.continuousUpdatesStillAutosave() }),
             ("captionMatchingRequiresMatchingSpeech", { try suite.captionMatchingRequiresMatchingSpeech() }),
+            ("incrementalCommitKeepsLongMonologue", { try suite.incrementalCommitKeepsLongMonologue() }),
             ("retryRecoversFailedAnswer", { try await suite.retryRecoversFailedAnswer() }),
             ("newMeetingArchivesAndClearsContext", { try await suite.newMeetingArchivesAndClearsContext() }),
             ("contextImportAndPackActions", { try await suite.contextImportAndPackActions() }),
@@ -76,6 +77,7 @@ struct WorkspaceTests {
         for (name, run) in checks {
             do { try await run(); print("PASS \(name)") }
             catch { failures += 1; print("FAIL \(name): \(error)") }
+            fflush(stdout)
         }
         guard failures == 0 else { throw CheckFailure.failed("\(failures) regression checks failed") }
         print("\(checks.count) regression checks passed")
@@ -308,6 +310,24 @@ struct WorkspaceTests {
         try await Task.sleep(for: .milliseconds(600))
         try check(provider.callCount == 3)
         try await model.flush()
+    }
+    func incrementalCommitKeepsLongMonologue() throws {
+        var committer = IncrementalTranscriptCommitter()
+        // Nothing to stabilize against on the first partial.
+        try check(committer.observe("Hello") == nil)
+        // Small stable growth stays open to revision.
+        try check(committer.observe("Hello everyone") == nil)
+        let sentence = "Hello everyone, welcome to the review. Today we walk through the launch plan and the open risks for Friday. "
+        let grown = sentence + "Then we assig"
+        try check(committer.observe(grown) == nil)
+        // Once the stable head is long enough, it commits at the sentence boundary.
+        let chunk = committer.observe(grown + "n owners for eac")
+        try check(chunk == "Hello everyone, welcome to the review. Today we walk through the launch plan and the open risks for Friday.")
+        try check(committer.remainder(for: grown + "n owners for eac") == "Then we assign owners for eac")
+        // Tail revision after a commit keeps committed text intact.
+        try check(committer.remainder(for: sentence + "Then we assigned somebody") == "Then we assigned somebody")
+        // Wholesale revision resyncs instead of stalling.
+        try check(committer.observe("Completely different words now.") == nil)
     }
     func localWorkerDrainsFinalAudioIntoQA() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
