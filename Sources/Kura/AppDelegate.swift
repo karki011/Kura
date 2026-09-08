@@ -30,22 +30,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu; statusItem = item
 
         panel = OverlayPanel(viewModel: viewModel)
-        if viewModel.sidebarOpen {
-            panel.minSize = NSSize(width: 900, height: 600)
-            if !panel.setFrameUsingName("KuraWorkspace") { panel.setContentSize(NSSize(width: 1000, height: 720)); panel.positionTopCenter() }
+        switch viewModel.viewMode {
+        case .icon:
+            panel.minSize = NSSize(width: 240, height: 120)
+            panel.setContentSize(NSSize(width: 300, height: 170))
+        case .compact:
+            panel.minSize = NSSize(width: 540, height: 360)
+            panel.setContentSize(NSSize(width: 560, height: 400))
+        case .full:
+            if viewModel.sidebarOpen {
+                panel.minSize = NSSize(width: 900, height: 600)
+                if !panel.setFrameUsingName("KuraWorkspace") { panel.setContentSize(NSSize(width: 1000, height: 720)); panel.positionTopCenter() }
+            }
         }
         viewModel.onSidebarResize = { [weak self] open in
-            guard let panel = self?.panel else { return }
+            guard let self, self.viewModel.viewMode == .full, let panel = self.panel else { return }
             panel.minSize = NSSize(width: open ? 900 : 680, height: 600)
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2
                 panel.animator().setContentSize(NSSize(width: open ? 1000 : 760, height: max(600, panel.frame.height)))
             }
         }
-        viewModel.onCompactResize = { [weak self] compact in
-            guard let panel = self?.panel else { return }
-            panel.minSize = NSSize(width: compact ? 540 : 900, height: compact ? 360 : 600)
-            panel.setContentSize(NSSize(width: compact ? 560 : 1000, height: compact ? 400 : 720))
+        viewModel.onViewModeResize = { [weak self] mode in
+            guard let self, let panel = self.panel else { return }
+            switch mode {
+            case .icon:
+                panel.minSize = NSSize(width: 240, height: 120)
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2
+                    panel.animator().setContentSize(NSSize(width: 300, height: 170))
+                }
+            case .compact:
+                panel.minSize = NSSize(width: 540, height: 360)
+                panel.setContentSize(NSSize(width: 560, height: 400))
+            case .full:
+                let open = self.viewModel.sidebarOpen
+                panel.minSize = NSSize(width: open ? 900 : 680, height: 600)
+                panel.setContentSize(NSSize(width: open ? 1000 : 760, height: max(600, panel.frame.height)))
+            }
         }
         hotkeys = HotkeyManager(viewModel: viewModel, panel: panel)
         hotkeys.onToggleOverlay = { [weak self] in self?.toggleOverlay() }

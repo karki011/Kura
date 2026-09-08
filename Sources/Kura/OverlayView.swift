@@ -30,6 +30,22 @@ struct OverlayView: View {
     @FocusState private var inputFocused: Bool
 
     var body: some View {
+        Group {
+            if viewModel.viewMode == .icon { IconOverlayView(viewModel: viewModel) }
+            else { workspace }
+        }
+        .modifier(KuraAppearance(chrome: viewModel.viewMode != .icon))
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(dropped ? KuraStyle.accent : Color.primary.opacity(0.12), lineWidth: dropped ? 3 : 1))
+        .disabled(viewModel.transitioning)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropped, perform: acceptDrop)
+        .sheet(isPresented: $showContext) { ContextView(viewModel: viewModel, onDone: { showContext = false }) }
+        .sheet(isPresented: $showCapture) { CaptureSetupView(model: viewModel) }
+        .sheet(item: $editingLine) { line in TranscriptEditor(line: line) { text, speaker, all in viewModel.correctLine(line, text: text, speaker: speaker, renameAll: all) } }
+        .sheet(item: $attachment) { item in AttachmentPreview(item: item) }
+        .onReceive(NotificationCenter.default.publisher(for: .kuraFocusInput)) { _ in inputFocused = true }
+    }
+    private var workspace: some View {
         HStack(spacing: 0) {
             if viewModel.sidebarOpen && !viewModel.compact { library.frame(width: 220); Divider() }
             VStack(spacing: 0) {
@@ -53,16 +69,6 @@ struct OverlayView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .modifier(KuraAppearance())
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(dropped ? KuraStyle.accent : Color.primary.opacity(0.12), lineWidth: dropped ? 3 : 1))
-        .disabled(viewModel.transitioning)
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropped, perform: acceptDrop)
-        .sheet(isPresented: $showContext) { ContextView(viewModel: viewModel, onDone: { showContext = false }) }
-        .sheet(isPresented: $showCapture) { CaptureSetupView(model: viewModel) }
-        .sheet(item: $editingLine) { line in TranscriptEditor(line: line) { text, speaker, all in viewModel.correctLine(line, text: text, speaker: speaker, renameAll: all) } }
-        .sheet(item: $attachment) { item in AttachmentPreview(item: item) }
-        .onReceive(NotificationCenter.default.publisher(for: .kuraFocusInput)) { _ in inputFocused = true }
     }
     private var header: some View {
         HStack(spacing: 12) {
@@ -94,7 +100,9 @@ struct OverlayView: View {
             }
             Menu {
                 Button("Meeting capture…") { showCapture = true }
-                Button(viewModel.compact ? "Expand workspace" : "Compact view") { viewModel.compact.toggle() }
+                if viewModel.viewMode != .full { Button("Expand workspace") { viewModel.setViewMode(.full) } }
+                if viewModel.viewMode != .compact { Button("Compact view") { viewModel.setViewMode(.compact) } }
+                Button("Icon view") { viewModel.setViewMode(.icon) }
                 Button("Export this meeting…") { viewModel.exportMeeting() }
                 Button("Settings…") { NotificationCenter.default.post(name: .kuraOpenSettings, object: nil) }
                 Divider()

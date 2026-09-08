@@ -21,6 +21,7 @@ enum AssistAction {
     }
 }
 enum WorkspaceTab: String, CaseIterable { case transcript = "Conversation", wrapUp = "Wrap-up" }
+enum OverlayViewMode: String { case full, compact, icon }
 
 @MainActor
 final class OverlayViewModel: ObservableObject {
@@ -35,7 +36,20 @@ final class OverlayViewModel: ObservableObject {
     @Published var selected: Meeting? { didSet { scheduleHistorySave() } }
     @Published var tab: WorkspaceTab = .transcript
     @Published var sidebarOpen = true { didSet { onSidebarResize?(sidebarOpen) } }
-    @Published var compact = false { didSet { onCompactResize?(compact) } }
+    @Published var viewMode: OverlayViewMode = OverlayViewMode(rawValue: UserDefaults.standard.string(forKey: "viewMode") ?? "") ?? .full {
+        didSet {
+            UserDefaults.standard.set(viewMode.rawValue, forKey: "viewMode")
+            onViewModeResize?(viewMode)
+        }
+    }
+    // Remembered so leaving icon mode restores whichever workspace was open.
+    @Published var previousExpandedMode: OverlayViewMode = OverlayViewMode(rawValue: UserDefaults.standard.string(forKey: "viewModeBeforeIcon") ?? "") ?? .full {
+        didSet { UserDefaults.standard.set(previousExpandedMode.rawValue, forKey: "viewModeBeforeIcon") }
+    }
+    var compact: Bool {
+        get { viewMode == .compact }
+        set { setViewMode(newValue ? .compact : .full) }
+    }
     @Published var alwaysOnActive = false
     @Published var captureStartedAt = Date.distantPast
     @Published var audioLevel: Double = 0
@@ -83,7 +97,7 @@ final class OverlayViewModel: ObservableObject {
     private var lastAudibleAudio = Date.distantPast
     private let providerFactory: @MainActor () -> any LLMProvider
     var onSidebarResize: ((Bool) -> Void)?
-    var onCompactResize: ((Bool) -> Void)?
+    var onViewModeResize: ((OverlayViewMode) -> Void)?
     var viewingMeeting: MeetingMeta? { selected?.meta }
     var qaActive: Bool { requestIsAuto && status == .streaming }
     var current: Meeting { selected ?? session }
@@ -103,6 +117,7 @@ final class OverlayViewModel: ObservableObject {
     init(root: URL? = nil, restore: Bool = true, providerFactory: @escaping @MainActor () -> any LLMProvider = { SettingsStore.shared.makeProvider() }) {
         self.providerFactory = providerFactory
         meetings = MeetingStore(root: root)
+        if previousExpandedMode == .icon { previousExpandedMode = .full }
         transcript.$lines.dropFirst().sink { [weak self] lines in self?.session.lines = lines }.store(in: &subscriptions)
         meetings.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         observer.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
@@ -134,6 +149,11 @@ final class OverlayViewModel: ObservableObject {
         if selected != nil { edit(&selected!) }
         else { edit(&session) }
     }
+    func setViewMode(_ mode: OverlayViewMode) {
+        if mode == .icon, viewMode != .icon { previousExpandedMode = viewMode }
+        viewMode = mode
+    }
+    func expandFromIcon() { setViewMode(previousExpandedMode == .icon ? .full : previousExpandedMode) }
     private func scheduleSave() {
         guard !restoring else { return }
         guard saveTask == nil else { return }

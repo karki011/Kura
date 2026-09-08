@@ -2,15 +2,22 @@ import SwiftUI
 
 /// Shared by the workspace and auxiliary windows so appearance stays in sync.
 struct KuraAppearance: ViewModifier {
+    var chrome = true
     @AppStorage("themeMode") private var themeMode = "auto"
     @AppStorage("overlayOpacity") private var opacity = 0.92
 
     func body(content: Content) -> some View {
         content
-            .background(.regularMaterial.opacity(opacity))
-            // Scale the solid base with the slider too — a constant 0.8 fill
-            // made even the lowest setting look opaque.
-            .background(Color(nsColor: .windowBackgroundColor).opacity(opacity * 0.7))
+            .background {
+                if chrome {
+                    ZStack {
+                        Rectangle().fill(.regularMaterial.opacity(opacity))
+                        // Scale the solid base with the slider too — a constant fill
+                        // made even the lowest setting look opaque.
+                        Color(nsColor: .windowBackgroundColor).opacity(opacity * 0.7)
+                    }
+                }
+            }
             .tint(KuraStyle.accent)
             .preferredColorScheme(themeMode == "dark" ? .dark : themeMode == "light" ? .light : nil)
     }
