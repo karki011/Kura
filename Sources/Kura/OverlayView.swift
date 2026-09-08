@@ -312,6 +312,11 @@ private struct TranscriptRow: View, Equatable {
     var onEdit: () -> Void
     var onAsk: () -> Void
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.line == rhs.line }
+    // Legacy sessions can hold pathological mega-lines (tens of KB from the
+    // EOU-latching era); rendering them whole melts the SwiftUI graph.
+    private var displayText: String {
+        line.text.count > 4000 ? String(line.text.prefix(4000)) + "\n… (very long passage — Copy gets the full text)" : line.text
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
@@ -325,9 +330,9 @@ private struct TranscriptRow: View, Equatable {
                     .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary).help("Copy passage").accessibilityLabel("Copy passage")
             }
             if line.source == "assistant" {
-                if line.isFinal { MarkdownText(text: line.text, fontSize: 14) }
-                else { Text(line.text.isEmpty ? "Thinking…" : line.text).font(.system(size: 14)).foregroundStyle(.secondary) }
-            } else { Text(line.text).font(.system(size: 14)).foregroundStyle(line.isFinal ? .primary : .secondary) }
+                if line.isFinal { MarkdownText(text: displayText, fontSize: 14) }
+                else { Text(displayText.isEmpty ? "Thinking…" : displayText).font(.system(size: 14)).foregroundStyle(.secondary) }
+            } else { Text(displayText).font(.system(size: 14)).foregroundStyle(line.isFinal ? .primary : .secondary) }
         }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
             .padding(line.source == "assistant" ? 12 : 0)
             .background(line.source == "assistant" ? KuraStyle.accent.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 12))
