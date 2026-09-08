@@ -240,7 +240,7 @@ struct OverlayView: View {
         }.padding(16).background(Color.primary.opacity(0.025))
     }
     private func duration(until now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(viewModel.session.meta.date)))
+        let seconds = max(0, Int(now.timeIntervalSince(viewModel.captureStartedAt)))
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
     private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {

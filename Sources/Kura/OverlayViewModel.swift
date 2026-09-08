@@ -37,6 +37,7 @@ final class OverlayViewModel: ObservableObject {
     @Published var sidebarOpen = true { didSet { onSidebarResize?(sidebarOpen) } }
     @Published var compact = false { didSet { onCompactResize?(compact) } }
     @Published var alwaysOnActive = false
+    @Published var captureStartedAt = Date.distantPast
     @Published var audioLevel: Double = 0
     @Published var ownVoiceActive = false
     @Published var captureStatus = "Ready when you are"
@@ -278,7 +279,7 @@ final class OverlayViewModel: ObservableObject {
         let local = useLocal ? LocalSpeechConfiguration.saved : nil
         do { try local?.validate() } catch { lastError = error.localizedDescription; return }
         lastError = ""; audioEpoch = UUID(); let epoch = audioEpoch
-        let captureStarted = Date()
+        let captureStarted = Date(); captureStartedAt = captureStarted
         let labels = session.lines.filter { $0.source == "speech" && $0.speaker != "You" }.map(\.speaker) + Array(speakerNames.keys)
         let greatestNumber = labels.filter { $0.hasPrefix("Speaker ") }.compactMap { Int($0.dropFirst(8)) }.max() ?? 0
         let offset = max(greatestNumber, Set(labels).count)
@@ -359,7 +360,29 @@ final class OverlayViewModel: ObservableObject {
     func askMore(_ text: String) { request("Explain this in more detail:\n\(text)", display: "Explain this passage") }
     private func scheduleAnswer(_ line: TranscriptLine) {
         guard autoQA, selected == nil, alwaysOnActive, line.source == "speech", line.speaker != "You", line.isFinal else { return }
-        guard SpokenQuestion.matches(line.text), !answeredLines.contains(line.id) else { return }
+        guard !answeredLines.contains(line.id) else { return }
+        if SpokenQuestion.matches(line.text) { scheduleConfirmedAnswer(line); return }
+        // Transcription drops punctuation and garbles phrasing, so the regex misses
+        // real questions. Ask the model once per line as a fallback.
+        guard line.text.split(whereSeparator: \.isWhitespace).count >= 3, !classifiedLines.contains(line.id) else { return }
+        classifiedLines.insert(line.id)
+        let target = session.id
+        Task { [weak self] in
+            guard let self else { return }
+            var verdict = ""
+            do {
+                let ask = LLMMessage(role: "user", content: "In this meeting transcript line, did the speaker ask a question or make a request an AI assistant should answer? Reply only yes or no.\n\n\(line.text)")
+                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [ask], system: "You classify meeting transcript lines. Reply only yes or no."), within: 5)
+                for try await delta in stream { verdict += delta }
+            } catch { return }
+            guard verdict.lowercased().contains("yes") else { return }
+            guard self.autoQA, self.selected == nil, self.alwaysOnActive, self.session.id == target else { return }
+            self.scheduleConfirmedAnswer(line)
+        }
+    }
+    private var classifiedLines = Set<UUID>()
+    private func scheduleConfirmedAnswer(_ line: TranscriptLine) {
+        guard !answeredLines.contains(line.id) else { return }
         cancelPendingAnswer()
         let pending = UUID(); pendingAnswerID = pending
         let target = session.id

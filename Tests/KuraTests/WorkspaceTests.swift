@@ -51,6 +51,7 @@ struct WorkspaceTests {
             ("busyAutoAnswerKeepsLatestQuestion", { try await suite.busyAutoAnswerKeepsLatestQuestion() }),
             ("pendingAutoAnswerCancelsWhenDisabledOrPaused", { try await suite.pendingAutoAnswerCancelsWhenDisabledOrPaused() }),
             ("spokenQuestionDetection", { try suite.spokenQuestionDetection() }),
+            ("spokenQuestionLLMFallback", { try await suite.spokenQuestionLLMFallback() }),
             ("localWorkerDrainsFinalAudioIntoQA", { try await suite.localWorkerDrainsFinalAudioIntoQA() }),
             ("providerCatalogAndReasoningPayloads", { try suite.providerCatalogAndReasoningPayloads() }),
             ("speakerCuesDoNotGuessFromParticipantLists", { try suite.speakerCuesDoNotGuessFromParticipantLists() }),
@@ -272,6 +273,24 @@ struct WorkspaceTests {
         for text in ["", "What", "We launch on Friday", "The answer is four", "I know what you mean"] {
             try check(!SpokenQuestion.matches(text))
         }
+    }
+    func spokenQuestionLLMFallback() async throws {
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let original = model.autoQA; defer { model.autoQA = original }
+        model.autoQA = true; model.alwaysOnActive = true
+        // Regex-miss phrasing: classifier says yes → classify call + answer call.
+        provider.response = "yes"
+        model.transcript.appendFinal("Never counts lots of run time", speaker: "Alex")
+        try await Task.sleep(for: .milliseconds(900))
+        try check(provider.callCount == 2)
+        // Classifier says no → no answer, and each line is classified only once.
+        provider.response = "no"
+        model.transcript.appendFinal("Some other garbled sentence entirely", speaker: "Alex")
+        try await Task.sleep(for: .milliseconds(600))
+        try check(provider.callCount == 3)
+        try await model.flush()
     }
     func localWorkerDrainsFinalAudioIntoQA() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
