@@ -35,8 +35,12 @@ struct OverlayView: View {
             else { workspace }
         }
         .modifier(KuraAppearance(chrome: viewModel.viewMode != .icon))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(dropped ? KuraStyle.accent : Color.primary.opacity(0.12), lineWidth: dropped ? 3 : 1))
+        .clipShape(RoundedRectangle(cornerRadius: viewModel.viewMode == .icon ? 0 : 18))
+        .overlay {
+            if viewModel.viewMode != .icon {
+                RoundedRectangle(cornerRadius: 18).stroke(dropped ? KuraStyle.accent : Color.primary.opacity(0.12), lineWidth: dropped ? 3 : 1)
+            }
+        }
         .disabled(viewModel.transitioning)
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropped, perform: acceptDrop)
         .sheet(isPresented: $showContext) { ContextView(viewModel: viewModel, onDone: { showContext = false }) }

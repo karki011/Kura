@@ -22,6 +22,7 @@ private struct BubbleShape: Shape {
 /// stays transparent; tint/color scheme come from OverlayView's KuraAppearance.
 struct IconOverlayView: View {
     @ObservedObject var viewModel: OverlayViewModel
+    @State private var pulse = false
 
     private var listening: Bool { viewModel.alwaysOnActive || viewModel.status == .listening }
     private var bubbleText: String {
@@ -37,11 +38,12 @@ struct IconOverlayView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(MarkdownText.attributed(bubbleText))
-                .font(.system(size: 12))
-                .lineLimit(3)
+                .font(.system(size: 12.5))
+                .lineLimit(8)
                 .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12).padding(.vertical, 9)
+                // Bubble grows with the window — drag any edge to resize.
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 12).padding(.vertical, 10)
                 .background {
                     BubbleShape()
                         .fill(.regularMaterial)
@@ -49,25 +51,39 @@ struct IconOverlayView: View {
                 }
                 .overlay { BubbleShape().stroke(KuraStyle.accent.opacity(0.45), lineWidth: 1) }
                 .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
-                .padding(.leading, 22)
+                .padding(.leading, 26)
                 .accessibilityLabel("Latest: \(bubbleText)")
-            Button { viewModel.expandFromIcon() } label: {
-                KuraLogo(size: 40)
-                    .overlay {
-                        if listening {
-                            Circle().stroke(KuraStyle.accent, lineWidth: 2).padding(-3)
+            HStack(spacing: 10) {
+                Button { viewModel.expandFromIcon() } label: {
+                    KuraLogo(size: 40)
+                        .overlay {
+                            if listening {
+                                Circle()
+                                    .stroke(KuraStyle.accent.opacity(pulse ? 0.95 : 0.25), lineWidth: 2)
+                                    .padding(-4)
+                                    .scaleEffect(pulse ? 1.07 : 1.0)
+                            }
                         }
-                    }
+                }
+                .buttonStyle(.plain)
+                .focusable(false)
+                .help("Open Kura workspace")
+                .accessibilityLabel("Open Kura workspace")
+                if viewModel.alwaysOnActive {
+                    ProgressView(value: viewModel.audioLevel)
+                        .tint(KuraStyle.accent)
+                        .frame(width: 44)
+                        .help("Live system audio — Kura is listening")
+                        .accessibilityLabel("Listening, audio level")
+                }
             }
-            .buttonStyle(.plain)
-            .focusable(false)
-            .help("Open Kura workspace")
-            .accessibilityLabel("Open Kura workspace")
             .padding(.leading, 8).padding(.top, 2)
         }
-        .padding(8)
+        .padding(10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .contentShape(Rectangle())
         .onTapGesture { viewModel.expandFromIcon() }
+        .onAppear { pulse = true }
+        .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulse)
     }
 }
