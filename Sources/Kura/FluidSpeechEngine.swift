@@ -53,6 +53,33 @@ enum CustomVocabulary {
     }
 }
 
+/// Word-level seam repair for FluidSpeechEngine's epoch-replay preroll: when an
+/// utterance runs right up to the ASR reset, the replayed preroll re-decodes
+/// speech the previous epoch already committed; drop that repeated prefix.
+/// Pure and FluidAudio-free so the plain-swiftc check build can test it.
+enum TranscriptSeam {
+    /// Returns `text` with any leading words removed that repeat the trailing
+    /// words of `previous`. The seam word may be truncated in `previous` (the
+    /// reset can land mid-word), so the last compared pair also matches when one
+    /// side is a ≥3-character prefix of the other.
+    static func stripReplayedPrefix(_ text: String, previous: String, maxWords: Int = 8) -> String {
+        let words = text.split(separator: " ").map(String.init)
+        let prevWords = previous.split(separator: " ").map(String.init)
+        let limit = min(words.count, prevWords.count, maxWords)
+        guard limit > 0 else { return text }
+        outer: for n in stride(from: limit, through: 1, by: -1) {
+            for i in 0..<n {
+                let a = words[i].lowercased()
+                let b = prevWords[prevWords.count - n + i].lowercased()
+                let same = a == b || (i == n - 1 && min(a.count, b.count) >= 3 && (a.hasPrefix(b) || b.hasPrefix(a)))
+                if !same { continue outer }
+            }
+            return words.dropFirst(n).joined(separator: " ")
+        }
+        return text
+    }
+}
+
 /// AVAudioPCMBuffer is not Sendable; the tap callback hands each buffer off exactly once.
 struct SendableAudioBuffer: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
@@ -106,7 +133,37 @@ actor FluidSpeechEngine {
     private var utteranceStartMs = 0
     private var pending: [Float] = []
     private var pendingRate: Double = 16000
+    /// While an utterance commits, the ASR drains and resets — chunks decoded in
+    /// that window would be discarded. Hold them in `pending` and process after.
+    private var resetting = false
     private var chunksProcessed = 0
+    /// Seconds of tap-rate audio fed to the ASR in the current epoch; the epoch
+    /// boundary in session time is `tokenEpochMs + epochAudioFedSeconds`.
+    private var epochAudioFedSeconds = 0.0
+    /// Fake silence injected into the epoch at EOU commits (to flush the tail); token
+    /// timestamps count it as epoch time, so it is subtracted when mapping to session time.
+    private var epochInjectedMs = 0
+    /// Tail of recently fed audio (tap rate), replayed into each fresh epoch:
+    /// the cache-aware encoder blanks speech that starts without a low-energy
+    /// lead-in after a reset (FluidAudio #838's failure class).
+    private var recentAudio: [Float] = []
+    private static let replayPrerollSeconds = 1.2
+    /// Set when the commit before a reset decoded audio inside the replay window;
+    /// the next commit then drops the re-decoded seam words.
+    private var dedupeNextCommit = false
+    private var lastCommitText = ""
+    /// Deferred epoch reset: EOU latches until reset, but resetting zeroes the
+    /// encoder caches — and a hard-to-decode voice starting right after the reset
+    /// can be blanked entirely, preroll replay notwithstanding. So the reset waits
+    /// until the pause provably persists: no new tokens AND quiet audio for
+    /// `deferredQuietSeconds`. Speech resuming before that lands in the still-warm
+    /// epoch and decodes normally.
+    private var epochNeedsReset = false
+    private static let deferredQuietSeconds = 1.0
+    private static let speechRmsGate = 0.01
+    private var lastTokenCount = 0
+    private var lastTokensAtFedSeconds = 0.0
+    private var lastLoudAtFedSeconds = 0.0
 
     private var onSegment: (@Sendable (SpeakerSegment) -> Void)?
     private var onPartial: (@Sendable (String) -> Void)?
@@ -196,6 +253,8 @@ actor FluidSpeechEngine {
         await prepareVocabularyBoosting(terms: CustomVocabulary.saved)
         NSLog("[fluid] diarizer: %@ (%d speaker slots)", loadedDiarizer.backend.rawValue, diarizer?.numSpeakers ?? 0)
         emittedInEpoch = ""; utteranceStartMs = 0; pending = []; emittedTokenCount = 0; tokenEpochMs = 0
+        epochAudioFedSeconds = 0; epochInjectedMs = 0; recentAudio = []; dedupeNextCommit = false; lastCommitText = ""
+        epochNeedsReset = false; lastTokenCount = 0; lastTokensAtFedSeconds = 0; lastLoudAtFedSeconds = 0
         sessionAudio = []; sessionAudioStartMs = 0; sessionAudioUsable = true
         failed = false; sessionActive = true; chunksProcessed = 0
         NSLog("[fluid] session running")
@@ -213,6 +272,8 @@ actor FluidSpeechEngine {
         let cap = Int(pendingRate * 30)
         if pending.count > cap { pending.removeFirst(pending.count - cap) }
         let chunkTarget = Int(pendingRate * 0.5)
+        // While a commit resets the ASR epoch, hold incoming audio and process it after.
+        guard !resetting else { return }
         while pending.count >= chunkTarget {
             let chunk = Array(pending.prefix(chunkTarget))
             pending.removeFirst(chunkTarget)
@@ -225,6 +286,8 @@ actor FluidSpeechEngine {
     func finishSession() async {
         guard sessionActive || diarizer != nil else { return }
         sessionActive = false
+        epochNeedsReset = false
+        epochInjectedMs = 0
         if !pending.isEmpty {
             let tail = pending; pending = []
             await processChunk(tail, rate: pendingRate)
@@ -256,6 +319,22 @@ actor FluidSpeechEngine {
             do {
                 try await asr.appendAudio(pcm)
                 try await asr.processBufferedAudio()
+                epochAudioFedSeconds += Double(samples.count) / rate
+                recentAudio.append(contentsOf: samples)
+                let keep = Int(rate * (Self.replayPrerollSeconds + 0.5))
+                if recentAudio.count > keep { recentAudio.removeFirst(recentAudio.count - keep) }
+                var energy = 0.0
+                for s in samples { energy += Double(s) * Double(s) }
+                if sqrt(energy / Double(samples.count)) > Self.speechRmsGate { lastLoudAtFedSeconds = epochAudioFedSeconds }
+                let tokenCount = await asr.getTokenTimestampsMs().count
+                if tokenCount != lastTokenCount {
+                    lastTokenCount = tokenCount
+                    lastTokensAtFedSeconds = epochAudioFedSeconds
+                }
+                if epochNeedsReset,
+                   epochAudioFedSeconds - max(lastLoudAtFedSeconds, lastTokensAtFedSeconds) >= Self.deferredQuietSeconds {
+                    await finalizeDeferredEpoch()
+                }
             } catch { fail("On-device transcription failed: \(error.localizedDescription)") }
         }
     }
@@ -273,21 +352,82 @@ actor FluidSpeechEngine {
     /// confirmation time (that trails speech by the debounce window).
     ///
     /// EOU latches per epoch — `eouDetected` blocks any further confirmation until
-    /// `reset()` — so each committed utterance ends the epoch: the ASR is reset and its
-    /// token timestamps restart at zero, tracked via `tokenEpochMs`.
+    /// `reset()` — but the reset is DEFERRED (see finalizeDeferredEpoch): the commit
+    /// happens immediately, while the epoch stays warm for speech that resumes quickly.
     private func utteranceEnded(accumulated: String) async {
         guard sessionActive, !failed, let asr else { return }
+        resetting = true
+        defer { resetting = false }
         // The callback's transcript snapshot lags: decoding continues through the debounce
         // window and the tail chunk may still be buffered. Drain it (padding to a full
-        // chunk) so the commit carries the complete utterance before the epoch resets.
+        // chunk) so the commit carries the complete utterance. The injected silence stays
+        // in the epoch (no reset yet) and is tracked in epochInjectedMs.
         await asr.injectSilence(0.7)
+        epochInjectedMs += 700
         try? await asr.processBufferedAudio()
         let latest = await asr.getPartialTranscript()
         await emit(accumulated: latest.isEmpty ? accumulated : latest)
-        let eouMs = await asr.getEouTimestampsMs().last ?? 0
+        epochNeedsReset = true
+        // Process whatever arrived mid-commit into the same, still-warm epoch.
+        let chunkTarget = Int(pendingRate * 0.5)
+        while pending.count >= chunkTarget {
+            let chunk = Array(pending.prefix(chunkTarget))
+            pending.removeFirst(chunkTarget)
+            await processChunk(chunk, rate: pendingRate)
+        }
+    }
+
+    /// Commits whatever accumulated since the EOU commit, then resets the epoch.
+    /// Runs only once the pause provably persists — no new tokens AND quiet audio for
+    /// `deferredQuietSeconds` — so an utterance starting right after the EOU lands in
+    /// the still-warm epoch instead of a freshly zeroed one (whose cache-aware encoder
+    /// can blank speech, FluidAudio #838's failure class; preroll replay of quiet
+    /// pause audio alone did not warm it enough for hard-to-decode voices).
+    /// While the reset is pending, EOU stays latched, so this silence rule is also
+    /// what splits a follow-up utterance after a ≥~1.5s pause.
+    private func finalizeDeferredEpoch() async {
+        guard sessionActive, !failed, epochNeedsReset, let asr else { return }
+        epochNeedsReset = false
+        resetting = true
+        defer { resetting = false }
+        let latest = await asr.getPartialTranscript()
+        await emit(accumulated: latest)
+        await resetEpoch(asr)
+        // Process whatever arrived mid-reset in the fresh epoch.
+        let chunkTarget = Int(pendingRate * 0.5)
+        while pending.count >= chunkTarget {
+            let chunk = Array(pending.prefix(chunkTarget))
+            pending.removeFirst(chunkTarget)
+            await processChunk(chunk, rate: pendingRate)
+        }
+    }
+
+    /// Resets the ASR epoch and re-feeds the tail of the pause into the fresh epoch.
+    /// The replay ends exactly where the held pending audio resumes, so no audio is
+    /// skipped or double-fed. `tokenEpochMs` is derived from the fed-sample count,
+    /// which makes it exact (the previous `getEouTimestampsMs` approximation trailed
+    /// by the decode lag).
+    private func resetEpoch(_ asr: StreamingEouAsrManager) async {
+        let resetPointMs = tokenEpochMs + Int(epochAudioFedSeconds * 1000)
+        let prerollSamples = min(Int(Self.replayPrerollSeconds * pendingRate), recentAudio.count)
+        let prerollMs = prerollSamples * 1000 / max(Int(pendingRate), 1)
+        // The seam can only repeat text when the commit just made (`utteranceStartMs`
+        // is now its end) decoded audio inside the replay window.
+        let seamOverlap = utteranceStartMs > resetPointMs - prerollMs
         await asr.reset()
-        tokenEpochMs += eouMs
+        if prerollSamples > 0, let pcm = Self.monoBuffer(Array(recentAudio.suffix(prerollSamples)), rate: pendingRate) {
+            try? await asr.appendAudio(pcm)
+            try? await asr.processBufferedAudio()
+        }
+        tokenEpochMs = resetPointMs - prerollMs
+        epochAudioFedSeconds = Double(prerollSamples) / pendingRate
+        epochInjectedMs = 0
         emittedInEpoch = ""; emittedTokenCount = 0
+        dedupeNextCommit = seamOverlap
+        lastTokenCount = 0
+        lastTokensAtFedSeconds = epochAudioFedSeconds
+        lastLoudAtFedSeconds = epochAudioFedSeconds
+        NSLog("[fluid] epoch reset: replayed %dms preroll, held %d pending samples", prerollMs, pending.count)
     }
 
     private func emit(accumulated: String, tokenTimestamps: [Int]? = nil, rawTokenStrings: [String]? = nil) async {
@@ -308,13 +448,15 @@ actor FluidSpeechEngine {
             let count = min(emittedTokenCount, raw.count)
             if raw.count > count {
                 let newTokens = raw[count...]
-                startMs = newTokens.first.map { $0 + tokenEpochMs } ?? startMs
-                endMs = (newTokens.last.map { $0 + tokenEpochMs } ?? startMs) + Self.chunkSize.durationMs
+                // Token stamps count injected commit-flush silence as epoch time.
+                startMs = newTokens.first.map { $0 + tokenEpochMs - epochInjectedMs } ?? startMs
+                endMs = (newTokens.last.map { $0 + tokenEpochMs - epochInjectedMs } ?? startMs) + Self.chunkSize.durationMs
             }
             emittedTokenCount = raw.count
             stamps = raw
             newTokenIndex = count
         }
+        // Rescore the unstripped text: it must match the token timings word-for-word.
         var committed = text
         if vocabSession != nil, newTokenIndex < stamps.count {
             let tokens: [String]
@@ -328,10 +470,19 @@ actor FluidSpeechEngine {
             // Audio behind this utterance (minus preroll for the next) is never rescored again.
             trimSessionAudio(beforeMs: endMs - 1000)
         }
+        if dedupeNextCommit {
+            // The replayed preroll re-decoded speech the previous epoch committed.
+            dedupeNextCommit = false
+            let stripped = TranscriptSeam.stripReplayedPrefix(committed, previous: lastCommitText)
+            if stripped != committed { NSLog("[fluid] seam dedupe: '%@' -> '%@'", committed, stripped) }
+            committed = stripped
+        }
+        guard !committed.isEmpty else { return }
         utteranceStartMs = endMs
         let startS = Double(startMs) / 1000
         let speaker = dominantSpeaker(start: startS, end: Double(endMs) / 1000 + 0.2)
         NSLog("[fluid] utterance committed speaker=%d start=%.1fs: %@", speaker, startS, committed)
+        lastCommitText = committed
         onSegment?(SpeakerSegment(speaker: speaker, text: committed, start: startS))
     }
 
@@ -416,8 +567,8 @@ actor FluidSpeechEngine {
         // groups SentencePiece "▁"-prefixed tokens into words and never reads tokenId.
         var timings: [TokenTiming] = []
         for i in index..<count {
-            let tokenStartMs = timestamps[i] + tokenEpochMs
-            let nextMs = i + 1 < count ? timestamps[i + 1] + tokenEpochMs : endMs
+            let tokenStartMs = timestamps[i] + tokenEpochMs - epochInjectedMs
+            let nextMs = i + 1 < count ? timestamps[i + 1] + tokenEpochMs - epochInjectedMs : endMs
             timings.append(TokenTiming(
                 token: tokens[i], tokenId: 0,
                 startTime: Double(tokenStartMs - sliceStartMs) / 1000,

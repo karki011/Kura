@@ -49,6 +49,13 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     private var consecutiveFailures = 0
     private var loggedFirstBuffer = false
     private var running = false
+    // The process tap is silent-gated: when every app goes quiet, no buffers flow
+    // and the engines never see the pause — end-of-utterance can't fire, so turns
+    // fuse into one mega-line. The watchdog below bridges short gaps with
+    // synthesized silence so VAD/EOU can close the turn.
+    private var lastRealBufferAt = Date.distantPast
+    private var tapFormat: AVAudioFormat?
+    private var silenceTimer: DispatchSourceTimer?
 
     // AVAudioPCMBuffer is not Sendable; boxes let tap callbacks cross to `queue` cleanly.
     private struct SendablePCMBuffer: @unchecked Sendable {
@@ -159,6 +166,7 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
             }
             let bytesPerFrame = asbd.mBytesPerFrame
             let captureGeneration = lifecycle.capture
+            tapFormat = format
             NSLog("[screenaudio] tap %u aggregate %u format %@", tapID, aggregateID, format.description)
             CaptureDiagnostics.shared.stage("Registering audio callback")
             err = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil) { [weak self] _, inputData, _, _, _ in
@@ -188,6 +196,7 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
                         loggedFirstBuffer = true
                         NSLog("[screenaudio] first audio buffer received")
                     }
+                    lastRealBufferAt = Date()
                     processBufferLocked(boxed.buffer)
                 }
             }
@@ -197,6 +206,8 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
             guard err == noErr else { throw TapError(message: "Could not start system audio (OSStatus \(err)). Check Settings → Permissions.") }
             NSLog("[screenaudio] capture started (process tap)")
             }
+
+            startSilenceWatchdogLocked()
 
             if engine == .fluid {
                 CaptureDiagnostics.shared.stage("Waiting for audio · on-device speech")
@@ -311,6 +322,8 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         lastText = ""
         consecutiveFailures = 0
         loggedFirstBuffer = false
+        silenceTimer?.cancel(); silenceTimer = nil
+        lastRealBufferAt = .distantPast
         if let engine = compatibilityEngine {
             engine.stop()
             engine.inputNode.removeTap(onBus: 0)
@@ -516,6 +529,38 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         lastText = ""
         guard !text.isEmpty, let cb = onTranscript else { return }
         Task { await cb(text, true) }
+    }
+
+    // MARK: Silence bridging
+
+    /// Feeds half a second of silence whenever the tap has been starved for 0.6s,
+    /// so the engines observe speech pauses even when no app emits audio. Stops
+    /// after 10s of quiet — that bounds idle inference cost, and a longer gap is
+    /// a real break whose utterance already committed. Only the direct driver
+    /// records a tap format, so the cloak fallback stays uninjected.
+    private func startSilenceWatchdogLocked() {
+        silenceTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [self] in
+            guard running else { return }
+            let sinceReal = Date().timeIntervalSince(lastRealBufferAt)
+            if sinceReal > 0.6 && sinceReal < 10 { injectSilenceLocked() }
+        }
+        silenceTimer = timer
+        timer.resume()
+    }
+    private func injectSilenceLocked() {
+        guard let format = tapFormat else { return }
+        let frames = AVAudioFrameCount(format.sampleRate * 0.5)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        if let channels = buffer.floatChannelData {
+            for channel in 0..<Int(format.channelCount) {
+                memset(channels[channel], 0, Int(frames) * MemoryLayout<Float>.size)
+            }
+        }
+        processBufferLocked(buffer)
     }
 
     private func processBufferLocked(_ buffer: AVAudioPCMBuffer) {

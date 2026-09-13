@@ -1,8 +1,10 @@
-# Kura handoff — September 12, 2026 (pm update)
+# Kura handoff — September 13, 2026 (engine fixes update)
 
 Supersedes the Sept 8 notes below where they conflict. Work is still on `kura-launch`; new work is uncommitted on top of `f7aa06f` at the time of writing. 41 Swift regression checks + 4 Python tests green (`bash check.sh`).
 
-## Done September 12 (live-tested on this Mac)
+## Done September 12-13 (live-tested on this Mac)
+
+0. **Turn-fusion + lost-speech engine fixes** (the "everything is one Unknown speaker" bug): two stacked causes, both fixed in `FluidSpeechEngine.swift`/`ScreenAudioManager.swift`. (a) The CoreAudio tap is silent-gated — no buffers flow when apps go quiet, so EOU never fired at pauses and turns fused into mega-lines. Fix: a silence watchdog feeds synthesized zeros when the tap starves 0.6-10s after real audio (bounds idle CPU). (b) Parakeet's cache-aware encoder decodes all-blank right after a hard `reset()` (FluidAudio #838-class quirk) — speech starting within ~0.3s of a commit's reset was blanked and lost. Fix: deferred epoch reset (reset only after 1.0s of proven quiet + no new tokens, so it can never land next to speech) + 1.2s preroll replay to warm fresh epochs + sample-exact `tokenEpochMs` + seam dedupe for replayed words. Live result: 3-voice diagnostic splits into 3 turns with 3 correct speaker slots; a hard synthetic voice's head can still partially blank on a cold epoch (model limitation, tail is preserved now — merge-beats-loss worst case). Worth upstreaming to FluidAudio.
 
 1. **Conversation-order fix**: on-device utterances commit on a separate channel from partials; the open partial was never closed, so live text kept rewriting a stale mid-transcript bubble. `TranscriptStore.discardOpenSpeechPartials()` now drops it as each utterance commits (`OverlayViewModel.swift` onSpeakerTranscript). Verified live with `Tests/Fixtures/two_speaker_conversation.sh` (two-voice TTS playback through the system-audio tap).
 2. **Diarizer default for real use**: LS-EEND merges even clearly different voices; Sortformer separated the test speakers correctly. Settings now on Sortformer (`defaults: diarizerBackend=sortformer`).

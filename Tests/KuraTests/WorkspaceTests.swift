@@ -90,6 +90,7 @@ struct WorkspaceTests {
             ("speakerBindingEvidenceAndUndo", { try await suite.speakerBindingEvidenceAndUndo() }),
             ("onDeviceCommitReplacesOpenPartialInOrder", { try suite.onDeviceCommitReplacesOpenPartialInOrder() }),
             ("customVocabularyTermParsing", { try suite.customVocabularyTermParsing() }),
+            ("transcriptSeamStripsReplayedPrefix", { try suite.transcriptSeamStripsReplayedPrefix() }),
             ("deepModelSettingsRouteByPurpose", { try await suite.deepModelSettingsRouteByPurpose() }),
             ("deletingViewedMeetingLandsOnFreshSession", { try await suite.deletingViewedMeetingLandsOnFreshSession() }),
             ("trashedMeetingStaysGoneAfterRelaunch", { try await suite.trashedMeetingStaysGoneAfterRelaunch() }),
@@ -702,6 +703,23 @@ struct WorkspaceTests {
         try check(CustomVocabulary.parseTerms("Kura, Parakeet\nSubash Karki") == ["Kura", "Parakeet", "Subash Karki"])
         try check(CustomVocabulary.parseTerms("kura\nKURA, Kura ,") == ["kura"])
         try check(CustomVocabulary.parseTerms(" LS-EEND ,,\nFluidAudio\t") == ["LS-EEND", "FluidAudio"])
+    }
+    func transcriptSeamStripsReplayedPrefix() throws {
+        // Exact word match strips (production gates this on the seam-overlap flag,
+        // so genuine repeats away from a reset seam are never touched).
+        try check(TranscriptSeam.stripReplayedPrefix("yes I think so", previous: "we said yes") == "I think so")
+        // Mid-word seam: the reset truncated the word in the previous commit.
+        try check(TranscriptSeam.stripReplayedPrefix("diagnostic sentence two", previous: "the pause between turns diagnost") == "sentence two")
+        // Multi-word overlap, case-insensitive.
+        try check(TranscriptSeam.stripReplayedPrefix("Sentence Two who", previous: "turns sentence two") == "who")
+        // Full repetition leaves nothing.
+        try check(TranscriptSeam.stripReplayedPrefix("short gap", previous: "a short gap") == "")
+        // No relation -> untouched; empty inputs are safe.
+        try check(TranscriptSeam.stripReplayedPrefix("who after", previous: "between turns") == "who after")
+        try check(TranscriptSeam.stripReplayedPrefix("hello", previous: "") == "hello")
+        try check(TranscriptSeam.stripReplayedPrefix("", previous: "hello") == "")
+        // The ≥3-char prefix floor blocks truncation-matching on tiny words.
+        try check(TranscriptSeam.stripReplayedPrefix("going home", previous: "let it go") == "going home")
     }
     @MainActor func deepModelSettingsRouteByPurpose() async throws {
         let defaults = UserDefaults.standard

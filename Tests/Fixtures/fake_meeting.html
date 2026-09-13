@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Weekly Sync — FakeMeet</title>
+<style>
+  body { margin: 0; background: #202124; color: #e8eaed; font-family: -apple-system, system-ui, sans-serif; }
+  .bar { padding: 10px 16px; background: #2d2e31; font-size: 14px; display: flex; justify-content: space-between; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 16px; }
+  .tile { background: #3c4043; border-radius: 10px; height: 150px; display: flex; align-items: flex-end; padding: 10px; position: relative; border: 3px solid transparent; }
+  .tile.active { border-color: #8ab4f8; }
+  .name { background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 6px; font-size: 14px; }
+  .speaking { padding: 8px 16px; font-size: 16px; color: #8ab4f8; }
+  .captions { padding: 10px 16px; font-size: 18px; background: rgba(0,0,0,.4); min-height: 28px; }
+  .start { margin: 16px; padding: 10px 22px; font-size: 16px; border: 0; border-radius: 8px; background: #8ab4f8; color: #202124; cursor: pointer; }
+  .hint { margin: 0 16px; font-size: 12px; color: #9aa0a6; }
+</style>
+</head>
+<body>
+  <div class="bar"><span>Weekly Sync</span><span>3 participants</span></div>
+  <div class="grid">
+    <div class="tile" id="t0"><span class="name">Alex Chen</span></div>
+    <div class="tile" id="t1"><span class="name">Maria Gomez</span></div>
+    <div class="tile" id="t2"><span class="name">Sam Rivera (You)</span></div>
+  </div>
+  <div class="speaking" id="speaking">Speaking: Alex Chen</div>
+  <div class="captions" id="captions">Alex Chen: Welcome to the weekly sync.</div>
+  <button class="start" id="start">Start meeting audio</button>
+  <button class="start" id="visual">Visual cues only (no audio)</button>
+  <p class="hint">"Start meeting audio" plays the meeting aloud with three voices, synced with the on-screen cues. "Visual cues only" rotates the speaker banner on a fixed schedule (matching speech_gauntlet.sh) while you play audio separately. Point Kura's Listen + speaker-name cues at this window.</p>
+<script>
+  // Self-contained fake meeting: speechSynthesis voices the turns and the
+  // speaker banner/captions advance when each utterance actually ends, so the
+  // visual cue and the audio stay in sync for Kura's screen reading.
+  const speakers = {
+    "Alex Chen":   { tile: "t0", pitch: 1.0, rate: 1.0 },
+    "Maria Gomez": { tile: "t1", pitch: 1.5, rate: 1.15 },
+    "Sam Rivera":  { tile: "t2", pitch: 0.7, rate: 0.85 },
+  };
+  const cues = [
+    { name: "Alex Chen",   text: "Let's kick off. Today we need to cover the release timeline, the budget review, and who owns the migration." },
+    { name: "Maria Gomez", text: "I ran the numbers quickly and the budget is basically fine, we are about eight percent under, so no blocker there." },
+    { name: "Sam Rivera",  text: "I would like to raise one concern. The migration plan still has no rollback step, and that worries me." },
+    { name: "Alex Chen",   text: "Fair point." },
+    { name: "Maria Gomez", text: "Agreed, we need it." },
+    { name: "Sam Rivera",  text: "Can someone write it?" },
+    { name: "Maria Gomez", text: "I can draft it tonight." },
+    { name: "Alex Chen",   text: "Here is the full timeline as I see it. This week we freeze the feature branch and finish the migration draft. Next week the release candidate goes to the beta group, and we watch the error rates closely. The week after that, if nothing catches fire, we ship to everyone and publish the notes." },
+    { name: "Sam Rivera",  text: "So just to confirm, when exactly do we ship to everyone?" },
+    { name: "Maria Gomez", text: "Third week from now." },
+    { name: "Alex Chen",   text: "Correct, assuming beta stays clean." },
+    { name: "Sam Rivera",  text: "Alright, that works for me." },
+    { name: "Alex Chen",   text: "Great. Maria owns the rollback draft, Sam reviews the migration plan, and I will send the summary. Thanks everyone." },
+  ];
+  let index = 0;
+  function show(cue) {
+    document.getElementById("speaking").textContent = "Speaking: " + cue.name;
+    document.getElementById("captions").textContent = cue.name + ": " + cue.text;
+    for (const s of Object.values(speakers)) document.getElementById(s.tile).classList.remove("active");
+    document.getElementById(speakers[cue.name].tile).classList.add("active");
+  }
+  function next() {
+    if (index >= cues.length) { document.getElementById("start").textContent = "Replay meeting"; return; }
+    const cue = cues[index++];
+    show(cue);
+    const u = new SpeechSynthesisUtterance(cue.text);
+    const s = speakers[cue.name];
+    u.pitch = s.pitch; u.rate = s.rate;
+    u.onend = () => setTimeout(next, 1600); // inter-turn pause, like real speech
+    speechSynthesis.speak(u);
+  }
+  document.getElementById("start").addEventListener("click", () => {
+    speechSynthesis.cancel(); index = 0;
+    document.getElementById("start").textContent = "Playing…";
+    next();
+  });
+  // Timer-driven cue rotation for use with an external audio source
+  // (schedule roughly matches Tests/Fixtures/speech_gauntlet.sh).
+  const visualCues = [
+    { at: 0,  name: "Alex Chen",   text: "Let's kick off and cover the release timeline." },
+    { at: 9,  name: "Maria Gomez", text: "The budget is basically fine, eight percent under." },
+    { at: 16, name: "Sam Rivera",  text: "The migration plan has no rollback step." },
+    { at: 24, name: "Alex Chen",   text: "Fair point, agreed we need it." },
+    { at: 31, name: "Maria Gomez", text: "I can draft it tonight." },
+    { at: 37, name: "Alex Chen",   text: "Here is the full timeline as I see it." },
+    { at: 56, name: "Sam Rivera",  text: "When exactly do we ship to everyone?" },
+    { at: 66, name: "Maria Gomez", text: "Third week from now." },
+    { at: 72, name: "Alex Chen",   text: "Maria owns the rollback draft. Thanks everyone." },
+  ];
+  document.getElementById("visual").addEventListener("click", () => {
+    speechSynthesis.cancel();
+    const t0 = Date.now();
+    document.getElementById("visual").textContent = "Cues running…";
+    function tick() {
+      const elapsed = (Date.now() - t0) / 1000;
+      let current = visualCues[0];
+      for (const cue of visualCues) { if (elapsed >= cue.at) current = cue; }
+      show(current);
+    }
+    tick(); setInterval(tick, 500);
+  });
+  // "?visual=1" auto-starts the cue rotation on load — no click needed
+  // (drives the test when the page is opened programmatically).
+  if (location.search.includes("visual=1")) { document.getElementById("visual").click(); }
+</script>
+</body>
+</html>
