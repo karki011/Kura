@@ -42,7 +42,7 @@ struct WorkspaceAIControls: View {
                 Text("Local").font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-        }.help("Changes apply to your next answer. Provider and API keys are managed in Settings.")
+        }.help("Live answers and typed questions use this model. Wrap-ups use the deep model when enabled in Settings → AI setup. Provider and API keys are managed in Settings.")
             .padding(.horizontal, 16).padding(.vertical, 6)
     }
 }

@@ -28,11 +28,39 @@ struct ActionItem: Identifiable, Codable, Equatable, Sendable {
     var sourceID: UUID?
 }
 struct MeetingWrapUp: Codable, Equatable, Sendable {
+    // The structured fields predate the freeform notes editor; they are kept so
+    // saved meetings still decode and can be seeded into notes.
     var summary = ""
     var decisions: [String] = []
     var questions: [String] = []
     var tasks: [ActionItem] = []
     var followUp = ""
+    var notes = ""
+    init() {}
+    enum CodingKeys: String, CodingKey { case summary, decisions, questions, tasks, followUp, notes }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        decisions = try c.decodeIfPresent([String].self, forKey: .decisions) ?? []
+        questions = try c.decodeIfPresent([String].self, forKey: .questions) ?? []
+        tasks = try c.decodeIfPresent([ActionItem].self, forKey: .tasks) ?? []
+        followUp = try c.decodeIfPresent(String.self, forKey: .followUp) ?? ""
+        notes = try c.decodeIfPresent(String.self, forKey: .notes) ?? ""
+    }
+    /// Markdown rendering of the legacy structured fields; empty when they hold nothing.
+    var legacyMarkdown: String {
+        var text = ""
+        if !summary.isEmpty { text += "## Summary\n\(summary)\n\n" }
+        if !decisions.isEmpty { text += "## Decisions\n" + decisions.map { "- \($0)" }.joined(separator: "\n") + "\n\n" }
+        if !tasks.isEmpty {
+            text += "## Action items\n" + tasks.map {
+                "- [\($0.completed ? "x" : " ")] \($0.title)" + ($0.owner.isEmpty ? "" : " — \($0.owner)") + ($0.deadline.isEmpty ? "" : " (\($0.deadline))")
+            }.joined(separator: "\n") + "\n\n"
+        }
+        if !questions.isEmpty { text += "## Open questions\n" + questions.map { "- \($0)" }.joined(separator: "\n") + "\n\n" }
+        if !followUp.isEmpty { text += "## Follow-up draft\n\(followUp)\n\n" }
+        return text
+    }
 }
 struct Meeting: Codable, Equatable, Sendable, Identifiable {
     var meta: MeetingMeta
@@ -44,6 +72,11 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
     var favorite = false
     var wrapUp = MeetingWrapUp()
     var endedAt: Date?
+    /// Running total of priced AI calls for this meeting. Unpriced usage (local models,
+    /// unknown model IDs) adds tokens to answer metadata but nothing here.
+    var aiSpendUSD: Double = 0
+    /// Which listen engine captured this meeting ("apple" / "fluid" / "realtime"); nil if never recorded.
+    var captureEngine: String?
     var id: UUID { meta.id }
     var hasContent: Bool { !lines.isEmpty || !context.isEmpty || !attachments.isEmpty || !goal.isEmpty || !meta.title.isEmpty || wrapUp != MeetingWrapUp() }
     var title: String {
@@ -52,7 +85,7 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
         return "Untitled meeting"
     }
     static func empty() -> Meeting { Meeting(meta: MeetingMeta(id: UUID(), title: "", date: Date())) }
-    enum CodingKeys: String, CodingKey { case meta, context, lines, goal, attachments, tags, favorite, wrapUp, endedAt }
+    enum CodingKeys: String, CodingKey { case meta, context, lines, goal, attachments, tags, favorite, wrapUp, endedAt, aiSpendUSD, captureEngine }
     init(meta: MeetingMeta) { self.meta = meta }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -65,6 +98,8 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
         favorite = try c.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
         wrapUp = try c.decodeIfPresent(MeetingWrapUp.self, forKey: .wrapUp) ?? MeetingWrapUp()
         endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
+        aiSpendUSD = try c.decodeIfPresent(Double.self, forKey: .aiSpendUSD) ?? 0
+        captureEngine = try c.decodeIfPresent(String.self, forKey: .captureEngine)
     }
     var contextForAI: String {
         var result = "Meeting: \(title)\nGoal: \(goal)\nNotes:\n\(context)"
@@ -75,15 +110,8 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
     var markdown: String {
         var text = "# \(title)\n\n\(meta.date.formatted())\n\n"
         if !goal.isEmpty { text += "## Goal\n\(goal)\n\n" }
-        if !wrapUp.summary.isEmpty { text += "## Summary\n\(wrapUp.summary)\n\n" }
-        if !wrapUp.decisions.isEmpty { text += "## Decisions\n" + wrapUp.decisions.map { "- \($0)" }.joined(separator: "\n") + "\n\n" }
-        if !wrapUp.tasks.isEmpty {
-            text += "## Action items\n" + wrapUp.tasks.map {
-                "- [\($0.completed ? "x" : " ")] \($0.title)" + ($0.owner.isEmpty ? "" : " — \($0.owner)") + ($0.deadline.isEmpty ? "" : " (\($0.deadline))")
-            }.joined(separator: "\n") + "\n\n"
-        }
-        if !wrapUp.questions.isEmpty { text += "## Open questions\n" + wrapUp.questions.map { "- \($0)" }.joined(separator: "\n") + "\n\n" }
-        if !wrapUp.followUp.isEmpty { text += "## Follow-up draft\n\(wrapUp.followUp)\n\n" }
+        if !wrapUp.notes.isEmpty { text += "## Wrap-up\n\(wrapUp.notes)\n\n" }
+        else { text += wrapUp.legacyMarkdown }
         text += "## Transcript\n\n"
         for line in lines where !line.text.isEmpty {
             let stamp = line.timestamp == .distantPast ? "" : " [\(line.timestamp.formatted(date: .omitted, time: .standard))]"

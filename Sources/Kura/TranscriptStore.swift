@@ -1,5 +1,16 @@
 import Foundation
 
+/// Cost/timing record for one assistant answer. Token fields are nil when the provider
+/// never reported usage; costUSD is nil when the model's price is unknown.
+struct AnswerMeta: Codable, Equatable, Sendable {
+    var model: String
+    var inputTokens: Int?
+    var outputTokens: Int?
+    var costUSD: Double?
+    var firstTokenSeconds: Double?
+    var totalSeconds: Double?
+}
+
 struct TranscriptLine: Identifiable, Equatable, Codable, Sendable {
     var id = UUID()
     var speaker: String
@@ -8,12 +19,14 @@ struct TranscriptLine: Identifiable, Equatable, Codable, Sendable {
     var timestamp = Date()
     var source: String = "speech"
     var suggestedName: String?
+    var answerMeta: AnswerMeta?
     init(id: UUID = UUID(), speaker: String, text: String, isFinal: Bool = true,
-         timestamp: Date = Date(), source: String = "speech", suggestedName: String? = nil) {
+         timestamp: Date = Date(), source: String = "speech", suggestedName: String? = nil, answerMeta: AnswerMeta? = nil) {
         self.id = id; self.speaker = speaker; self.text = text; self.isFinal = isFinal
         self.timestamp = timestamp; self.source = source; self.suggestedName = suggestedName
+        self.answerMeta = answerMeta
     }
-    enum CodingKeys: String, CodingKey { case id, speaker, text, isFinal, timestamp, source, suggestedName }
+    enum CodingKeys: String, CodingKey { case id, speaker, text, isFinal, timestamp, source, suggestedName, answerMeta }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
@@ -23,6 +36,7 @@ struct TranscriptLine: Identifiable, Equatable, Codable, Sendable {
         timestamp = try c.decodeIfPresent(Date.self, forKey: .timestamp) ?? .distantPast
         source = try c.decodeIfPresent(String.self, forKey: .source) ?? (speaker == "AI" ? "assistant" : "speech")
         suggestedName = try c.decodeIfPresent(String.self, forKey: .suggestedName)
+        answerMeta = try c.decodeIfPresent(AnswerMeta.self, forKey: .answerMeta)
     }
 }
 
@@ -71,6 +85,13 @@ final class TranscriptStore: ObservableObject {
             lines[i].text = text; lines[i].isFinal = true
             if !text.isEmpty { onLineFinalized?(lines[i]) }
         } else { appendFinal(text, speaker: speaker) }
+    }
+    /// On-device utterances commit on a separate channel from partials, so the open
+    /// partial is dropped when the final line lands — otherwise every later partial
+    /// keeps rewriting that one stale bubble mid-conversation. The mic speaker's
+    /// partial belongs to a different recognizer and is left alone.
+    func discardOpenSpeechPartials() {
+        lines.removeAll { $0.source == "speech" && !$0.isFinal && $0.speaker != "You" }
     }
     func appendFinal(_ text: String, speaker: String, source: String = "speech", timestamp: Date = Date(), suggestedName: String? = nil) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }

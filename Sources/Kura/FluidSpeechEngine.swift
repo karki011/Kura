@@ -2,16 +2,19 @@
 // (Parakeet EOU 120M streaming ASR on the ANE + LS-EEND or Sortformer streaming diarization).
 // Replaces the Python whisper.cpp/pyannote pipeline: models download from Hugging Face on
 // first use and run offline afterwards. Speaker indices are session-stable 0-based slots.
+// Committed utterances are optionally re-checked against user-supplied names/jargon
+// ("customVocabulary") via FluidAudio's CTC vocabulary rescoring.
 import AVFoundation
 import Foundation
 
 /// Which engine transcribes the system-audio tap. Persisted in UserDefaults as
 /// "transcriptionBackend"; the retired Python pipeline's "local" value now maps to `.fluid`.
 enum TranscriptionEngine: String {
-    case apple, fluid
+    case apple, fluid, realtime
     static var saved: TranscriptionEngine {
         let raw = UserDefaults.standard.string(forKey: "transcriptionBackend") ?? "apple"
-        return raw == "apple" ? .apple : .fluid
+        if raw == "local" { return .fluid }
+        return TranscriptionEngine(rawValue: raw) ?? .apple
     }
 }
 
@@ -22,6 +25,31 @@ enum DiarizerBackend: String {
     case eend, sortformer
     static var saved: DiarizerBackend {
         DiarizerBackend(rawValue: UserDefaults.standard.string(forKey: "diarizerBackend") ?? "") ?? .eend
+    }
+}
+
+/// User-supplied terms (names, products, jargon) that on-device transcription
+/// re-checks committed utterances against. Persisted raw as a String in
+/// UserDefaults; parsed here, outside the FluidAudio gate, so the plain-swiftc
+/// check build can test the parsing.
+enum CustomVocabulary {
+    static let defaultsKey = "customVocabulary"
+
+    /// Splits on newlines/commas, trims, drops empties, dedupes case-insensitively
+    /// (first occurrence's spelling wins).
+    static func parseTerms(_ raw: String) -> [String] {
+        var seen = Set<String>()
+        var terms: [String] = []
+        for piece in raw.split(whereSeparator: { $0.isNewline || $0 == "," }) {
+            let term = piece.trimmingCharacters(in: .whitespaces)
+            guard !term.isEmpty, seen.insert(term.lowercased()).inserted else { continue }
+            terms.append(term)
+        }
+        return terms
+    }
+
+    static var saved: [String] {
+        parseTerms(UserDefaults.standard.string(forKey: defaultsKey) ?? "")
     }
 }
 
@@ -51,6 +79,19 @@ actor FluidSpeechEngine {
     private var asr: StreamingEouAsrManager?
     private var loadedDiarizer: (backend: DiarizerBackend, model: LoadedDiarizerModel)?
     private var diarizer: (any Diarizer)?
+
+    // Custom vocabulary rescoring: committed utterances are re-checked against the
+    // configured terms using a CTC spotter model (~110MB, downloaded lazily the first
+    // time terms exist). Best-effort — any failure logs and keeps the original text.
+    private var ctcModels: CtcModels?
+    private var vocabSession: VocabularyBoostingSession?
+    private var vocabSessionTerms: [String] = []
+    // Rolling tap-rate audio backing the rescorer, mapped to session time via
+    // sessionAudioStartMs and trimmed as utterances commit.
+    private var sessionAudio: [Float] = []
+    private var sessionAudioStartMs = 0
+    private var sessionAudioRate: Double = 16000
+    private var sessionAudioUsable = true
 
     private var prepareRunning = false
     private var prepareWaiters: [CheckedContinuation<Void, Error>] = []
@@ -111,6 +152,11 @@ actor FluidSpeechEngine {
                 model = .eend(try await LSEENDModel.loadFromHuggingFace(variant: Self.eendVariant, stepSize: .step100ms))
             }
             loadedDiarizer = (backend, model)
+            let vocabTerms = CustomVocabulary.saved
+            if !vocabTerms.isEmpty {
+                progress(0.98, "Preparing custom vocabulary")
+                await prepareVocabularyBoosting(terms: vocabTerms)
+            }
             prepareRunning = false
             let waiters = prepareWaiters; prepareWaiters = []
             for waiter in waiters { waiter.resume() }
@@ -146,8 +192,11 @@ actor FluidSpeechEngine {
         case .eend(let model):
             diarizer = try LSEENDDiarizer(model: model)
         }
+        // Picks up term edits made while the models were already warm; no-op when unchanged.
+        await prepareVocabularyBoosting(terms: CustomVocabulary.saved)
         NSLog("[fluid] diarizer: %@ (%d speaker slots)", loadedDiarizer.backend.rawValue, diarizer?.numSpeakers ?? 0)
         emittedInEpoch = ""; utteranceStartMs = 0; pending = []; emittedTokenCount = 0; tokenEpochMs = 0
+        sessionAudio = []; sessionAudioStartMs = 0; sessionAudioUsable = true
         failed = false; sessionActive = true; chunksProcessed = 0
         NSLog("[fluid] session running")
     }
@@ -159,6 +208,7 @@ actor FluidSpeechEngine {
         guard let samples = Self.monoSamples(audio.buffer) else { return }
         pendingRate = audio.buffer.format.sampleRate
         pending.append(contentsOf: samples)
+        if vocabSession != nil { retainSessionAudio(samples, rate: pendingRate) }
         // If inference ever falls behind realtime, drop the oldest audio instead of growing memory.
         let cap = Int(pendingRate * 30)
         if pending.count > cap { pending.removeFirst(pending.count - cap) }
@@ -181,15 +231,17 @@ actor FluidSpeechEngine {
         }
         if let diarizer { _ = try? diarizer.finalizeSession() }
         if let asr {
-            // finish() clears the accumulated token timestamps; snapshot them first.
+            // finish() clears the accumulated tokens and timestamps; snapshot them first.
             let timestamps = await asr.getTokenTimestampsMs()
+            let tokens = await asr.getRawTokenStrings()
             if let full = try? await asr.finish() {
-                await emit(accumulated: full, tokenTimestamps: timestamps)
+                await emit(accumulated: full, tokenTimestamps: timestamps, rawTokenStrings: tokens)
                 await asr.reset()
             }
         }
         diarizer = nil
         failed = false
+        sessionAudio = []; sessionAudioStartMs = 0
     }
 
     private func processChunk(_ samples: [Float], rate: Double) async {
@@ -238,13 +290,15 @@ actor FluidSpeechEngine {
         emittedInEpoch = ""; emittedTokenCount = 0
     }
 
-    private func emit(accumulated: String, tokenTimestamps: [Int]? = nil) async {
+    private func emit(accumulated: String, tokenTimestamps: [Int]? = nil, rawTokenStrings: [String]? = nil) async {
         let fresh = accumulated.hasPrefix(emittedInEpoch) ? String(accumulated.dropFirst(emittedInEpoch.count)) : accumulated
         let text = fresh.trimmingCharacters(in: .whitespacesAndNewlines)
         defer { emittedInEpoch = accumulated }
         guard !text.isEmpty else { return }
         var startMs = max(utteranceStartMs, tokenEpochMs)
         var endMs = startMs
+        var stamps: [Int] = []
+        var newTokenIndex = 0
         if let asr {
             let raw: [Int]
             if let tokenTimestamps { raw = tokenTimestamps }
@@ -258,12 +312,129 @@ actor FluidSpeechEngine {
                 endMs = (newTokens.last.map { $0 + tokenEpochMs } ?? startMs) + Self.chunkSize.durationMs
             }
             emittedTokenCount = raw.count
+            stamps = raw
+            newTokenIndex = count
+        }
+        var committed = text
+        if vocabSession != nil, newTokenIndex < stamps.count {
+            let tokens: [String]
+            if let rawTokenStrings { tokens = rawTokenStrings }
+            else if let asr { tokens = await asr.getRawTokenStrings() }
+            else { tokens = [] }
+            if let corrected = await rescoreCommittedUtterance(text, startMs: startMs, endMs: endMs,
+                                                               timestamps: stamps, tokens: tokens, from: newTokenIndex) {
+                committed = corrected
+            }
+            // Audio behind this utterance (minus preroll for the next) is never rescored again.
+            trimSessionAudio(beforeMs: endMs - 1000)
         }
         utteranceStartMs = endMs
         let startS = Double(startMs) / 1000
         let speaker = dominantSpeaker(start: startS, end: Double(endMs) / 1000 + 0.2)
-        NSLog("[fluid] utterance committed speaker=%d start=%.1fs: %@", speaker, startS, text)
-        onSegment?(SpeakerSegment(speaker: speaker, text: text, start: startS))
+        NSLog("[fluid] utterance committed speaker=%d start=%.1fs: %@", speaker, startS, committed)
+        onSegment?(SpeakerSegment(speaker: speaker, text: committed, start: startS))
+    }
+
+    /// Builds (or tears down) the CTC vocabulary-boosting session for the given terms.
+    /// Loads the spotter model lazily on first use; failures disable boosting rather
+    /// than affecting transcription.
+    private func prepareVocabularyBoosting(terms: [String]) async {
+        guard !terms.isEmpty else { vocabSession = nil; vocabSessionTerms = []; return }
+        guard vocabSession == nil || terms != vocabSessionTerms else { return }
+        do {
+            if ctcModels == nil {
+                NSLog("[fluid] custom vocabulary: preparing CTC spotter model (one-time download if needed)")
+                ctcModels = try await CtcModels.downloadAndLoad(variant: .ctc110m)
+            }
+            let tokenizer = try await CtcTokenizer.load(from: CtcModels.defaultCacheDirectory(for: .ctc110m))
+            let vocabTerms = terms.compactMap { term -> CustomVocabularyTerm? in
+                let ids = tokenizer.encode(term)
+                return ids.isEmpty ? nil : CustomVocabularyTerm(text: term, weight: 10.0, ctcTokenIds: ids)
+            }
+            guard !vocabTerms.isEmpty, let ctcModels else {
+                vocabSession = nil; vocabSessionTerms = terms
+                return
+            }
+            vocabSession = try await VocabularyBoostingSession(
+                vocabulary: CustomVocabularyContext(terms: vocabTerms), ctcModels: ctcModels)
+            vocabSessionTerms = terms
+            NSLog("[fluid] custom vocabulary boosting active (%d terms)", vocabTerms.count)
+        } catch {
+            NSLog("[fluid] custom vocabulary unavailable, continuing without corrections: %@", error.localizedDescription)
+            vocabSession = nil
+        }
+    }
+
+    private func retainSessionAudio(_ samples: [Float], rate: Double) {
+        guard sessionAudioUsable else { return }
+        guard rate == sessionAudioRate else {
+            // A mid-session rate change breaks the sample→time mapping; disable
+            // retention rather than rescore against misaligned audio.
+            NSLog("[fluid] tap sample rate changed mid-session; vocabulary rescoring disabled until next Listen")
+            sessionAudio = []; sessionAudioUsable = false
+            return
+        }
+        sessionAudio.append(contentsOf: samples)
+        // Hard bound for pathological no-EOU stretches; committed utterances are far shorter.
+        let cap = Int(sessionAudioRate * 60)
+        if sessionAudio.count > cap { dropSessionAudio(sessionAudio.count - cap) }
+    }
+
+    private func dropSessionAudio(_ count: Int) {
+        let dropped = min(max(count, 0), sessionAudio.count)
+        guard dropped > 0 else { return }
+        sessionAudio.removeFirst(dropped)
+        sessionAudioStartMs += dropped * 1000 / Int(sessionAudioRate)
+    }
+
+    private func trimSessionAudio(beforeMs: Int) {
+        dropSessionAudio((beforeMs - sessionAudioStartMs) * Int(sessionAudioRate) / 1000)
+    }
+
+    /// Session-time window of the retained tap audio, nil when it fell outside the
+    /// retained range.
+    private func sessionAudioSlice(fromMs: Int, toMs: Int) -> [Float]? {
+        let rate = Int(sessionAudioRate)
+        let start = (fromMs - sessionAudioStartMs) * rate / 1000
+        let end = min((toMs - sessionAudioStartMs) * rate / 1000, sessionAudio.count)
+        guard start >= 0, end > start else { return nil }
+        return Array(sessionAudio[start..<end])
+    }
+
+    /// Re-checks a committed utterance against the custom vocabulary using CTC acoustic
+    /// evidence over the utterance's retained audio. Returns the corrected text, or nil
+    /// to keep the original.
+    private func rescoreCommittedUtterance(_ text: String, startMs: Int, endMs: Int,
+                                           timestamps: [Int], tokens: [String], from index: Int) async -> String? {
+        guard let vocabSession else { return nil }
+        // Pre/post-roll so the CTC pass sees word onsets at the slice edges.
+        let sliceStartMs = max(0, startMs - 500)
+        guard let slice = sessionAudioSlice(fromMs: sliceStartMs, toMs: endMs + 500) else { return nil }
+        let count = min(timestamps.count, tokens.count)
+        guard index < count else { return nil }
+        // Token timings on the slice's clock (t=0 at the first sample); the rescorer
+        // groups SentencePiece "▁"-prefixed tokens into words and never reads tokenId.
+        var timings: [TokenTiming] = []
+        for i in index..<count {
+            let tokenStartMs = timestamps[i] + tokenEpochMs
+            let nextMs = i + 1 < count ? timestamps[i + 1] + tokenEpochMs : endMs
+            timings.append(TokenTiming(
+                token: tokens[i], tokenId: 0,
+                startTime: Double(tokenStartMs - sliceStartMs) / 1000,
+                endTime: Double(max(nextMs, tokenStartMs) - sliceStartMs) / 1000,
+                confidence: 1))
+        }
+        do {
+            let samples = try AudioConverter().resample(slice, from: sessionAudioRate)
+            guard let output = await vocabSession.rescore(text: text, tokenTimings: timings, audioSamples: samples) else { return nil }
+            let corrected = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !corrected.isEmpty, corrected != text else { return nil }
+            NSLog("[fluid] vocabulary correction: %@ → %@", text, corrected)
+            return corrected
+        } catch {
+            NSLog("[fluid] vocabulary rescoring failed, keeping original text: %@", error.localizedDescription)
+            return nil
+        }
     }
 
     private func partialUpdated(_ accumulated: String) {

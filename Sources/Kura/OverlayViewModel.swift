@@ -62,6 +62,8 @@ final class OverlayViewModel: ObservableObject {
     @Published var lastDeleted: UUID?
     @Published private(set) var lastAutoBinding: AutoSpeakerBinding?
     @Published var progress = ""
+    /// 0…1 while a wrap-up is generating (per transcript chunk); -1 otherwise.
+    @Published var wrapUpFraction: Double = -1
     @Published private(set) var autoAnswerStatus = ""
     @Published var autoQA = UserDefaults.standard.bool(forKey: "autoQA") {
         didSet {
@@ -99,10 +101,18 @@ final class OverlayViewModel: ObservableObject {
     private var previewCaptureTask: Task<Void, Never>?
     private var captureHealthTask: Task<Void, Never>?
     private var lastAudibleAudio = Date.distantPast
-    private let providerFactory: @MainActor () -> any LLMProvider
+    private let providerFactory: @MainActor (Bool) -> any LLMProvider
     var onSidebarResize: ((Bool) -> Void)?
     var onViewModeResize: ((OverlayViewMode) -> Void)?
     var viewingMeeting: MeetingMeta? { selected?.meta }
+    /// Short label for the engine that captured a meeting (header badge).
+    static func engineLabel(_ raw: String) -> String {
+        switch raw {
+        case "realtime": return "OpenAI Realtime"
+        case "fluid": return "On-device"
+        default: return "Apple Speech"
+        }
+    }
     var qaActive: Bool { requestIsAuto && status == .streaming }
     var current: Meeting { selected ?? session }
     var sessionContext: String {
@@ -118,7 +128,7 @@ final class OverlayViewModel: ObservableObject {
         }
     }
 
-    init(root: URL? = nil, restore: Bool = true, providerFactory: @escaping @MainActor () -> any LLMProvider = { SettingsStore.shared.makeProvider() }) {
+    init(root: URL? = nil, restore: Bool = true, providerFactory: @escaping @MainActor (Bool) -> any LLMProvider = { deep in SettingsStore.shared.makeProvider(deep: deep) }) {
         self.providerFactory = providerFactory
         meetings = MeetingStore(root: root)
         if previousExpandedMode == .icon { previousExpandedMode = .full }
@@ -220,7 +230,7 @@ final class OverlayViewModel: ObservableObject {
         }
     }
     func viewMeeting(_ meeting: Meeting) {
-        guard !transitioning else { return }
+        guard !transitioning else { notice = "Still switching meetings — try again in a moment."; return }
         stopAnswer(); cancelPendingAnswer(); lastRequest = nil
         if meeting.id == session.id { selected = nil; tab = .wrapUp; return }
         transitioning = true
@@ -241,12 +251,17 @@ final class OverlayViewModel: ObservableObject {
     }
     func deleteMeeting(_ meeting: Meeting) {
         guard meeting.id != session.id else { notice = "Start a new meeting before moving the current session to Trash."; return }
+        let wasViewing = selected?.id == meeting.id
         Task {
             do {
-                if selected?.id == meeting.id { stopAnswer(); try await flush(); selected = nil }
+                if wasViewing { stopAnswer(); try await flush(); selected = nil }
                 try await meetings.repository.trash(meeting.id)
                 meetings.meetings.removeAll { $0.id == meeting.id }; lastDeleted = meeting.id
                 notice = "Meeting moved to Kura’s Trash"
+                // Deleting the meeting on screen must not drop the user back into
+                // the live session's old chat — that reads as "the delete didn't
+                // work". Land on a fresh meeting; the live session is archived.
+                if wasViewing { startNewSession() }
             } catch { lastError = error.localizedDescription }
         }
     }
@@ -303,6 +318,7 @@ final class OverlayViewModel: ObservableObject {
         }
         lastError = ""; audioEpoch = UUID(); let epoch = audioEpoch
         let captureStarted = Date(); captureStartedAt = captureStarted
+        session.captureEngine = engine.rawValue
         let labels = session.lines.filter { $0.source == "speech" && $0.speaker != "You" }.map(\.speaker) + Array(speakerNames.keys)
         let greatestNumber = labels.filter { $0.hasPrefix("Speaker ") }.compactMap { Int($0.dropFirst(8)) }.max() ?? 0
         let offset = max(greatestNumber, Set(labels).count)
@@ -315,12 +331,13 @@ final class OverlayViewModel: ObservableObject {
             guard let self, self.audioEpoch == epoch else { return }
             let raw = segment.speaker < 0 ? "Unknown speaker" : "Speaker \(offset + segment.speaker + 1)"
             let speaker = self.speakerNames[raw] ?? raw
+            self.transcript.discardOpenSpeechPartials()
             self.transcript.appendFinal(segment.text, speaker: speaker, timestamp: captureStarted.addingTimeInterval(segment.start), suggestedName: self.suggestedName(for: segment.text))
             if let cue = self.activeSpeakerCue() { self.recordSpeakerCue(name: cue, slot: raw) }
         }
         screenAudio.onLevel = { [weak self] level in
             guard let self, self.audioEpoch == epoch, self.alwaysOnActive else { return }
-            self.audioLevel = level; self.captureStatus = engine == .fluid ? "Listening · on-device speaker labels" : "Listening"
+            self.audioLevel = level; self.captureStatus = engine == .fluid ? "Listening · on-device speaker labels" : engine == .realtime ? "Listening · OpenAI Realtime" : "Listening"
             if level > 0.005 {
                 self.lastAudibleAudio = Date()
                 if self.notice.hasPrefix("No audible system audio detected.") { self.notice = "" }
@@ -330,7 +347,7 @@ final class OverlayViewModel: ObservableObject {
             guard let self, self.audioEpoch == epoch, self.alwaysOnActive else { return }
             self.lastError = error; self.stopCapture()
         }
-        alwaysOnActive = true; captureStatus = engine == .fluid ? "Preparing on-device speech…" : "Connecting audio…"
+        alwaysOnActive = true; captureStatus = engine == .fluid ? "Preparing on-device speech…" : engine == .realtime ? "Connecting OpenAI Realtime…" : "Connecting audio…"
         session.endedAt = nil
         if engine == .fluid {
             // First use downloads the CoreML models; capture starts once they are ready.
@@ -353,6 +370,22 @@ final class OverlayViewModel: ObservableObject {
                 } catch {
                     guard self.audioEpoch == epoch, self.alwaysOnActive, !Task.isCancelled else { return }
                     self.lastError = "On-device speech setup failed: \(error.localizedDescription)"
+                    self.stopCapture()
+                }
+            }
+        } else if engine == .realtime {
+            // No model downloads: prepare only verifies the OpenAI key exists.
+            modelPrepareTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await RealtimeSpeechEngine.shared.prepare()
+                    guard self.audioEpoch == epoch, self.alwaysOnActive else { return }
+                    self.screenAudio.realtimeContext = { [weak self] in await self?.realtimeSessionContext() ?? "" }
+                    self.screenAudio.start(engine: .realtime)
+                    self.captureStatus = "Listening · OpenAI Realtime"
+                } catch {
+                    guard self.audioEpoch == epoch, self.alwaysOnActive, !Task.isCancelled else { return }
+                    self.lastError = error.localizedDescription
                     self.stopCapture()
                 }
             }
@@ -404,11 +437,19 @@ final class OverlayViewModel: ObservableObject {
         case .whatToSay: request("Suggest a useful, concise thing I could say next based on the discussion and my goal.", display: action.title)
         case .followUps:
             let wrap = current.wrapUp
-            let notes = "Summary: \(wrap.summary)\nDecisions: \(wrap.decisions.joined(separator: "; "))\nTasks: \(wrap.tasks.map { "\($0.title) — \($0.owner), \($0.deadline)" }.joined(separator: "\n"))"
-            request("Draft a follow-up message using the reviewed decisions and tasks below. Do not invent commitments.\n" + String(notes.prefix(16000)), display: action.title, followUp: true)
+            let notes = wrap.notes.isEmpty ? wrap.legacyMarkdown : wrap.notes
+            request("Draft a follow-up message using the wrap-up notes below. Do not invent commitments.\n" + String(notes.prefix(16000)), display: action.title, followUp: true)
         }
     }
     func askMore(_ text: String) { request("Explain this in more detail:\n\(text)", display: "Explain this passage") }
+    // Meeting background plus a rolling transcript tail — the realtime session's
+    // instructions, refreshed on each rotation so context survives the 60-minute handoff.
+    private func realtimeSessionContext() -> String {
+        var context = session.contextForAI
+        let tail = ConversationContext.recent(session.lines, maxChars: 8000)
+        if !tail.isEmpty { context += "\n\nRecent conversation:\n\(tail)" }
+        return context
+    }
     private func scheduleAnswer(_ line: TranscriptLine) {
         guard autoQA, selected == nil, alwaysOnActive, line.source == "speech", line.speaker != "You", line.isFinal else { return }
         guard !answeredLines.contains(line.id) else { return }
@@ -421,11 +462,13 @@ final class OverlayViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             var verdict = ""
+            let usageBox = LLMUsageBox()
             do {
                 let ask = LLMMessage(role: "user", content: "In this meeting transcript line, did the speaker ask a question or make a request an AI assistant should answer? Reply only yes or no.\n\n\(line.text)")
-                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [ask], system: "You classify meeting transcript lines. Reply only yes or no."), within: self.firstTokenWindow())
+                let stream = StreamTiming.firstDelta(self.providerFactory(false).stream(messages: [ask], system: "You classify meeting transcript lines. Reply only yes or no.", onUsage: { usage in usageBox.usage = usage }), within: self.firstTokenWindow())
                 for try await delta in stream { verdict += delta }
             } catch { return }
+            self.accumulateSpend(usage: usageBox.usage, model: SettingsStore.shared.modelConfig(deep: false).model, target: target)
             guard verdict.lowercased().contains("yes") else { return }
             guard self.autoQA, self.selected == nil, self.alwaysOnActive, self.session.id == target else { return }
             self.scheduleConfirmedAnswer(line)
@@ -460,12 +503,21 @@ final class OverlayViewModel: ObservableObject {
                   self.alwaysOnActive, self.session.id == target, self.status == .idle,
                   !self.restoring, !self.transitioning else { return }
             self.answeredLines.insert(line.id)
-            self.request("Answer this spoken question briefly: \(line.text)", display: "Auto answer", automatic: true)
+            // With the realtime engine live, the answer comes from the model that heard
+            // the meeting audio directly; everything else keeps the chat provider.
+            if TranscriptionEngine.saved == .realtime, self.alwaysOnActive {
+                self.requestRealtimeAnswer(line.text)
+            } else {
+                self.request("Answer this spoken question briefly: \(line.text)", display: "Auto answer", automatic: true)
+            }
         }
     }
     // Reasoning effort above "low" thinks before it speaks, so a 5s first-token
     // window would kill healthy requests; fast modes must still meet the 5s bar.
-    private func firstTokenWindow() -> Double {
+    // Deep requests (wrap-ups, manual questions) are user-waited, not live — they
+    // get a generous window for high-effort reasoning.
+    private func firstTokenWindow(deep: Bool = false) -> Double {
+        if deep { return 30 }
         guard ProviderKind(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") == .openAI else { return 8 }
         let effort = UserDefaults.standard.string(forKey: "directOpenAIEffort") ?? "low"
         return ["none", "minimal", "low"].contains(effort) ? 5 : 20
@@ -495,11 +547,13 @@ final class OverlayViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             var name = ""
+            let usageBox = LLMUsageBox()
             do {
                 let prompt = "Name this meeting in 6 words or fewer, based on its opening. Reply with only the title, no quotes, no trailing punctuation.\n\n\(material.prefix(1500))"
-                let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: [LLMMessage(role: "user", content: prompt)], system: "You write short meeting titles."), within: 8)
+                let stream = StreamTiming.firstDelta(self.providerFactory(false).stream(messages: [LLMMessage(role: "user", content: prompt)], system: "You write short meeting titles.", onUsage: { usage in usageBox.usage = usage }), within: 8)
                 for try await delta in stream { name += delta }
             } catch { return }
+            self.accumulateSpend(usage: usageBox.usage, model: SettingsStore.shared.modelConfig(deep: false).model, target: target)
             let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'."))
             guard !cleaned.isEmpty, self.session.id == target, self.session.meta.title.isEmpty else { return }
             self.editCurrent { $0.meta.title = String(cleaned.prefix(60)) }
@@ -515,25 +569,38 @@ final class OverlayViewModel: ObservableObject {
             if let i = lines.firstIndex(where: { $0.id == id }) { edit(&lines[i]); transcript.replace(lines) }
         } else if selected?.id == target, let i = selected?.lines.firstIndex(where: { $0.id == id }) { edit(&selected!.lines[i]) }
     }
+    /// Adds the priced cost of one billable call to the meeting total. Unpriced usage
+    /// (unknown model, local provider) returns nil and leaves the total untouched.
+    @discardableResult
+    private func accumulateSpend(usage: LLMUsage?, model: String, target: UUID) -> Double? {
+        guard let usage, let cost = ModelPricing.cost(for: usage, model: model), cost > 0, current.id == target else { return nil }
+        editCurrent { $0.aiSpendUSD += cost }
+        return cost
+    }
     private func request(_ prompt: String, display: String, automatic: Bool = false, followUp: Bool = false) {
         guard status != .streaming, !restoring, !transitioning else { return }
         let snapshot = current; let token = UUID(); requestID = token
+        let model = SettingsStore.shared.modelConfig(deep: !automatic).model
         let line = TranscriptLine(speaker: "Kura", text: "", isFinal: false, source: "assistant")
         activeLineID = line.id; activeTargetID = snapshot.id; requestIsAuto = automatic
         lastRequest = (prompt, display); lastRequestTarget = snapshot.id; lastRequestFollowUp = followUp; lastError = ""; status = .streaming
         append(TranscriptLine(speaker: "You", text: display, source: "prompt"), target: snapshot.id)
         append(line, target: snapshot.id)
         let messages = [LLMMessage(role: "user", content: "Background:\n\(snapshot.contextForAI)\n\nRecent conversation:\n\(ConversationContext.recent(snapshot.lines))\n\nRequest:\n\(prompt)")]
+        let usageBox = LLMUsageBox()
+        let startedAt = Date()
         streamTask = Task { [weak self] in
             guard let self else { return }
             var pending = ""; var full = ""; var lastFlush = Date()
+            var firstDeltaAt: Date?
             var attempt = 0
             while true {
                 attempt += 1
                 do {
-                    let stream = StreamTiming.firstDelta(self.providerFactory().stream(messages: messages, system: systemPrompt), within: self.firstTokenWindow())
+                    let stream = StreamTiming.firstDelta(self.providerFactory(!automatic).stream(messages: messages, system: systemPrompt, onUsage: { usage in usageBox.usage = usage }), within: self.firstTokenWindow(deep: !automatic))
                     for try await delta in stream {
                         try Task.checkCancellation(); guard self.requestID == token else { return }
+                        if firstDeltaAt == nil { firstDeltaAt = Date() }
                         pending += delta; full += delta
                         if Date().timeIntervalSince(lastFlush) >= 0.08 {
                             let batch = pending; pending = ""; lastFlush = Date()
@@ -542,8 +609,14 @@ final class OverlayViewModel: ObservableObject {
                     }
                     try Task.checkCancellation(); guard self.requestID == token else { return }
                     guard !full.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KuraError.message("The provider returned no text. Check the model settings and retry.") }
-                    self.updateLine(line.id, target: snapshot.id) { $0.text = full; $0.isFinal = true }
-                    if followUp { self.editCurrent { $0.wrapUp.followUp = full }; self.tab = .wrapUp }
+                    let usage = usageBox.usage
+                    let meta = AnswerMeta(model: model,
+                                          inputTokens: usage?.inputTokens, outputTokens: usage?.outputTokens,
+                                          costUSD: self.accumulateSpend(usage: usage, model: model, target: snapshot.id),
+                                          firstTokenSeconds: firstDeltaAt?.timeIntervalSince(startedAt),
+                                          totalSeconds: Date().timeIntervalSince(startedAt))
+                    self.updateLine(line.id, target: snapshot.id) { $0.text = full; $0.isFinal = true; $0.answerMeta = meta }
+                    if followUp { self.editCurrent { $0.wrapUp.notes = $0.wrapUp.notes.appendingSection("## Follow-up draft", body: full) }; self.tab = .wrapUp }
                     self.finishRequest(token)
                     return
                 } catch {
@@ -564,9 +637,59 @@ final class OverlayViewModel: ObservableObject {
             }
         }
     }
+    // Realtime auto answer: streams from the live session instead of the chat provider.
+    // Only for spoken questions during capture — typed questions and wrap-ups still use
+    // request()/providerFactory. Same bookkeeping (requestID, activeLineID) so
+    // interrupt/stop/retry behave identically.
+    private func requestRealtimeAnswer(_ question: String) {
+        guard status != .streaming, !restoring, !transitioning else { return }
+        let snapshot = current; let token = UUID(); requestID = token
+        let line = TranscriptLine(speaker: "Kura", text: "", isFinal: false, source: "assistant")
+        activeLineID = line.id; activeTargetID = snapshot.id; requestIsAuto = true
+        lastRequest = ("Answer this spoken question briefly: \(question)", "Auto answer")
+        lastRequestTarget = snapshot.id; lastRequestFollowUp = false; lastError = ""; status = .streaming
+        append(TranscriptLine(speaker: "You", text: "Auto answer", source: "prompt"), target: snapshot.id)
+        append(line, target: snapshot.id)
+        let usageBox = LLMUsageBox()
+        let startedAt = Date()
+        streamTask = Task { [weak self] in
+            guard let self else { return }
+            var pending = ""; var full = ""; var lastFlush = Date()
+            var firstDeltaAt: Date?
+            do {
+                for try await delta in RealtimeSpeechEngine.shared.respond(to: question, onUsage: { usage in usageBox.usage = usage }) {
+                    try Task.checkCancellation(); guard self.requestID == token else { return }
+                    if firstDeltaAt == nil { firstDeltaAt = Date() }
+                    pending += delta; full += delta
+                    if Date().timeIntervalSince(lastFlush) >= 0.08 {
+                        let batch = pending; pending = ""; lastFlush = Date()
+                        self.updateLine(line.id, target: snapshot.id) { $0.text += batch }
+                    }
+                }
+                try Task.checkCancellation(); guard self.requestID == token else { return }
+                guard !full.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KuraError.message("The realtime session returned no text.") }
+                let usage = usageBox.usage
+                let meta = AnswerMeta(model: RealtimeWire.model,
+                                      inputTokens: usage.map { $0.inputTokens + ($0.audioInputTokens ?? 0) },
+                                      outputTokens: usage.map { $0.outputTokens + ($0.audioOutputTokens ?? 0) },
+                                      costUSD: self.accumulateSpend(usage: usage, model: RealtimeWire.model, target: snapshot.id),
+                                      firstTokenSeconds: firstDeltaAt?.timeIntervalSince(startedAt),
+                                      totalSeconds: Date().timeIntervalSince(startedAt))
+                self.updateLine(line.id, target: snapshot.id) { $0.text = full; $0.isFinal = true; $0.answerMeta = meta }
+                self.finishRequest(token)
+            } catch {
+                guard self.requestID == token else { return }
+                self.updateLine(line.id, target: snapshot.id) {
+                    $0.text = full.isEmpty ? "Answer failed — \(String(error.localizedDescription.prefix(140)))" : full
+                    $0.isFinal = true
+                }
+                self.lastError = error.localizedDescription; self.finishRequest(token)
+            }
+        }
+    }
     private func finishRequest(_ token: UUID) {
         guard token == requestID else { return }
-        status = .idle; requestIsAuto = false; streamTask = nil; activeLineID = nil; activeTargetID = nil; progress = ""
+        status = .idle; requestIsAuto = false; streamTask = nil; activeLineID = nil; activeTargetID = nil; progress = ""; wrapUpFraction = -1
     }
     func stopAnswer() {
         streamTask?.cancel(); cancelPendingAnswer(); requestID = UUID()
@@ -591,35 +714,64 @@ final class OverlayViewModel: ObservableObject {
         guard !chunks.isEmpty else { lastError = "Add conversation notes or start listening before creating a wrap-up."; return }
         status = .streaming; lastError = ""; tab = .wrapUp
         let token = UUID(); requestID = token
+        let model = SettingsStore.shared.modelConfig(deep: true).model
         streamTask = Task { [weak self] in
             guard let self else { return }
             do {
-                var combined = MeetingWrapUp()
+                // Each chunk revises the running notes into one coherent document, so a
+                // long transcript never produces repeated section headings.
+                var notes = snapshot.wrapUp.notes
                 for (index, chunk) in chunks.enumerated() {
                     self.progress = "Reviewing section \(index + 1) of \(chunks.count)…"
-                    let part = try await WrapUpGenerator.extract(chunk: chunk, context: snapshot.contextForAI, provider: self.providerFactory())
-                    try Task.checkCancellation(); guard self.requestID == token else { return }
-                    combined.summary += (combined.summary.isEmpty ? "" : "\n\n") + part.summary
-                    combined.decisions += part.decisions; combined.questions += part.questions; combined.tasks += part.tasks
+                    self.wrapUpFraction = Double(index) / Double(chunks.count)
+                    let usageBox = LLMUsageBox()
+                    let prompt = """
+                    Write the meeting wrap-up as markdown. Use these sections, omitting any the conversation does not support: ## Summary (a short paragraph), ## Decisions (bulleted confirmed decisions), ## Action items (bulleted, with owner and deadline only when stated), ## Open questions (bulleted), ## Follow-up draft (a short message the user could send).
+                    Never invent a speaker name, decision, owner, or deadline. Reply with only the markdown.
+                    \(notes.isEmpty ? "" : "\nWrap-up so far (revise and extend it, keeping existing content):\n\(notes)\n")
+                    Background:
+                    \(snapshot.contextForAI)
+
+                    Transcript section \(index + 1) of \(chunks.count):
+                    \(chunk)
+                    """
+                    var attempt = 0
+                    var revised = ""
+                    while true {
+                        attempt += 1
+                        do {
+                            revised = ""
+                            var lastFlush = Date()
+                            let stream = StreamTiming.firstDelta(self.providerFactory(true).stream(messages: [LLMMessage(role: "user", content: prompt)], system: systemPrompt, onUsage: { usage in usageBox.usage = usage }), within: self.firstTokenWindow(deep: true))
+                            for try await delta in stream {
+                                try Task.checkCancellation(); guard self.requestID == token else { return }
+                                revised += delta
+                                if Date().timeIntervalSince(lastFlush) >= 0.08 {
+                                    lastFlush = Date()
+                                    self.editCurrent { $0.wrapUp.notes = revised }
+                                }
+                            }
+                            try Task.checkCancellation(); guard self.requestID == token else { return }
+                            guard !revised.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KuraError.message("The provider returned no text. Check the model settings and try Generate again.") }
+                            self.accumulateSpend(usage: usageBox.usage, model: model, target: snapshot.id)
+                            break
+                        } catch {
+                            guard self.requestID == token else { return }
+                            // A stall before any text is retryable once, like request().
+                            if revised.isEmpty && attempt < 2 && !Task.isCancelled {
+                                self.notice = "No response — retrying…"
+                                continue
+                            }
+                            throw error
+                        }
+                    }
+                    notes = revised
+                    self.editCurrent { $0.wrapUp.notes = revised }
+                    self.wrapUpFraction = Double(index + 1) / Double(chunks.count)
                 }
-                let ids = Set(snapshot.lines.map(\.id))
-                combined.tasks = combined.tasks.map { item in var value = item; if let id = value.sourceID, !ids.contains(id) { value.sourceID = nil }; return value }
-                let reviewed = self.current.wrapUp
-                combined.decisions += reviewed.decisions.filter { !$0.isEmpty }
-                combined.decisions = Array(NSOrderedSet(array: combined.decisions)) as? [String] ?? combined.decisions
-                combined.questions = Array(NSOrderedSet(array: combined.questions)) as? [String] ?? combined.questions
-                // Preserve user-managed tasks and their completion state on regeneration.
-                var seenTasks = Set<String>()
-                combined.tasks = combined.tasks.filter { seenTasks.insert($0.title.lowercased() + "|" + $0.owner.lowercased()).inserted }
-                for previous in reviewed.tasks {
-                    if let i = combined.tasks.firstIndex(where: { $0.title.caseInsensitiveCompare(previous.title) == .orderedSame }) { combined.tasks[i] = previous }
-                    else { combined.tasks.append(previous) }
-                }
-                combined.followUp = reviewed.followUp
-                self.editCurrent { $0.wrapUp = combined }
                 try await self.flush()
                 if self.selected == nil { try await self.meetings.save(self.session) }
-                self.notice = "Wrap-up saved. Review the decisions and assign your next steps."
+                self.notice = "Wrap-up saved. Review and edit before sharing."
                 self.finishRequest(token)
             } catch {
                 guard self.requestID == token else { return }
@@ -628,10 +780,19 @@ final class OverlayViewModel: ObservableObject {
             }
         }
     }
+    /// Seeds the freeform notes from legacy structured fields once, so old meetings
+    /// open as readable text without overwriting anything the user has written.
+    func seedWrapUpNotesIfNeeded() {
+        let wrap = current.wrapUp
+        guard wrap.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let legacy = wrap.legacyMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !legacy.isEmpty else { return }
+        editCurrent { $0.wrapUp.notes = legacy }
+    }
     func captureDecision() {
         let value = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { notice = "Type a decision in the question box, then choose Capture decision."; return }
-        editCurrent { $0.wrapUp.decisions.append(value) }
+        editCurrent { $0.wrapUp.notes = $0.wrapUp.notes.appendingBullet(value, under: "## Decisions") }
         append(TranscriptLine(speaker: "You", text: value, source: "decision"), target: current.id)
         question = ""; notice = "Decision captured"
     }
@@ -692,7 +853,6 @@ final class OverlayViewModel: ObservableObject {
             }
             transcript.replace(lines)
         } else { selected?.lines = lines }
-        if renameAll { editCurrent { for i in $0.wrapUp.tasks.indices where $0.wrapUp.tasks[i].owner == line.speaker { $0.wrapUp.tasks[i].owner = name } } }
     }
     func importFiles(_ urls: [URL]) {
         guard !importing else { return }
@@ -761,29 +921,17 @@ enum KuraError: LocalizedError {
     var errorDescription: String? { if case .message(let text) = self { text } else { nil } }
 }
 
-enum WrapUpGenerator {
-    private struct Response: Decodable {
-        struct Item: Decodable { var title: String; var owner: String?; var deadline: String?; var sourceID: String? }
-        var summary: String; var decisions: [String]; var questions: [String]; var tasks: [Item]
+extension String {
+    /// Appends a markdown bullet under a heading, creating the section when missing.
+    func appendingBullet(_ bullet: String, under heading: String) -> String {
+        let line = "- \(bullet)"
+        guard let headingRange = range(of: heading) else { return appendingSection(heading, body: line) }
+        let sectionEnd = self[headingRange.upperBound...].range(of: "\n## ")?.lowerBound ?? endIndex
+        let body = self[headingRange.upperBound..<sectionEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(self[..<headingRange.upperBound]) + "\n\n" + (body.isEmpty ? line : body + "\n" + line) + self[sectionEnd...]
     }
-    static func parse(_ text: String) throws -> MeetingWrapUp {
-        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") else { throw KuraError.message("The model did not return structured meeting notes.") }
-        let response = try JSONDecoder().decode(Response.self, from: Data(text[start...end].utf8))
-        return MeetingWrapUp(summary: response.summary, decisions: response.decisions, questions: response.questions,
-                             tasks: response.tasks.map { ActionItem(title: $0.title, owner: $0.owner ?? "", deadline: $0.deadline ?? "", sourceID: $0.sourceID.flatMap(UUID.init(uuidString:))) })
-    }
-    static func extract(chunk: String, context: String, provider: any LLMProvider) async throws -> MeetingWrapUp {
-        let prompt = """
-        Extract notes from this transcript section. Return only JSON:
-        {"summary":"brief paragraph","decisions":["confirmed decision"],"questions":["unresolved question"],"tasks":[{"title":"action","owner":"name only if explicit, otherwise empty","deadline":"only if stated, otherwise empty","sourceID":"exact supporting transcript UUID"}]}
-        Use empty arrays when nothing is supported. Do not treat suggestions as decisions.
-        Background: \(context)
-        Transcript: \(chunk)
-        """
-        var text = ""
-        for try await delta in provider.stream(messages: [LLMMessage(role: "user", content: prompt)], system: systemPrompt) {
-            try Task.checkCancellation(); text += delta
-        }
-        return try parse(text)
+    func appendingSection(_ heading: String, body: String) -> String {
+        let base = trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? "\(heading)\n\n\(body)" : base + "\n\n\(heading)\n\n\(body)"
     }
 }

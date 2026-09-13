@@ -48,39 +48,59 @@ struct SettingsStore: Sendable {
         defaults.string(forKey: "reasoningEffort").flatMap { $0.isEmpty ? nil : $0 } ?? "none"
     }
 
-    var activeModel: String {
+    /// When on, wrap-ups and manual questions use the deep model/effort below
+    /// while live auto answers keep the fast configuration.
+    var deepModelEnabled: Bool { defaults.bool(forKey: "deepModelEnabled") }
+
+    /// Resolved model + effort for a purpose. Deep falls back to the answer
+    /// model when no override is set, so enabling it without picking a model
+    /// only raises effort.
+    func modelConfig(deep: Bool = false) -> (model: String, effort: String) {
+        let useDeep = deep && deepModelEnabled
+        func deepValue(_ key: String) -> String? {
+            guard useDeep else { return nil }
+            return defaults.string(forKey: key).flatMap { $0.isEmpty ? nil : $0 }
+        }
         switch provider {
-        case .anthropic: anthropicModel
-        case .openAI: defaults.string(forKey: "directOpenAIModel") ?? "gpt-5-mini"
-        case .openAICompatible: openAIModel
-        case .ollama: ollamaModel
+        case .anthropic:
+            let model = deepValue("deepAnthropicModel") ?? anthropicModel
+            let effort = deepValue("deepAnthropicEffort") ?? (useDeep ? "high" : (defaults.string(forKey: "anthropicEffort") ?? "default"))
+            return (model, effort)
+        case .openAI:
+            let model = deepValue("deepOpenAIModel") ?? (defaults.string(forKey: "directOpenAIModel") ?? "gpt-5-mini")
+            let effort = deepValue("deepOpenAIEffort") ?? (useDeep ? "high" : (defaults.string(forKey: "directOpenAIEffort") ?? "low"))
+            return (model, effort)
+        case .openAICompatible:
+            return (deepValue("deepCompatModel") ?? openAIModel, deepValue("deepCompatEffort") ?? reasoningEffort)
+        case .ollama:
+            return (deepValue("deepOllamaModel") ?? ollamaModel, "")
         }
     }
 
-    func makeProvider() -> any LLMProvider {
+    func makeProvider(deep: Bool = false) -> any LLMProvider {
+        let config = modelConfig(deep: deep)
         switch provider {
         case .anthropic:
-            let model = anthropicModel, effort = defaults.string(forKey: "anthropicEffort") ?? "default"
-            let adaptive = ModelCatalog.cached(.anthropic).first { $0.id == model }?.adaptiveThinking ?? false
+            let adaptive = ModelCatalog.cached(.anthropic).first { $0.id == config.model }?.adaptiveThinking ?? false
             let limit = answerTokenLimit
             return KeychainBackedProvider(account: "anthropic") { key in
-                AnthropicProvider(apiKey: key, model: model, effort: effort, adaptiveThinking: adaptive, tokenLimit: limit)
+                AnthropicProvider(apiKey: key, model: config.model, effort: config.effort, adaptiveThinking: adaptive, tokenLimit: limit)
             }
         case .openAI:
             // Effort above "low" reasons before speaking and cannot meet the 5s
             // first-token bar; default to low. Users can still opt into more.
-            let model = activeModel, effort = defaults.string(forKey: "directOpenAIEffort") ?? "low", limit = answerTokenLimit
+            let limit = answerTokenLimit
             let fast = defaults.object(forKey: "openAIFastMode") as? Bool ?? true
             return KeychainBackedProvider(account: "openai-direct") { key in
-                OpenAIResponsesProvider(apiKey: key, model: model, effort: effort, tokenLimit: limit, fastMode: fast)
+                OpenAIResponsesProvider(apiKey: key, model: config.model, effort: config.effort, tokenLimit: limit, fastMode: fast)
             }
         case .openAICompatible:
-            let base = openAIBaseURL, model = openAIModel, effort = reasoningEffort
+            let base = openAIBaseURL
             return KeychainBackedProvider(account: "openai") { key in
-                OpenAICompatibleProvider(apiKey: key, baseURL: base, model: model, effort: effort)
+                OpenAICompatibleProvider(apiKey: key, baseURL: base, model: config.model, effort: config.effort)
             }
         case .ollama:
-            return OllamaProvider(baseURL: ollamaBaseURL, model: ollamaModel)
+            return OllamaProvider(baseURL: ollamaBaseURL, model: config.model)
         }
     }
     var answerTokenLimit: Int {
@@ -104,6 +124,15 @@ struct SettingsView: View {
     @AppStorage("debugMode") private var debugMode = false
     @AppStorage("overlayOpacity") private var overlayOpacity = 0.92
     @AppStorage("themeMode") private var themeMode = "auto"
+    @AppStorage("deepModelEnabled") private var deepModelEnabled = false
+    @AppStorage("deepAnthropicModel") private var deepAnthropicModel = ""
+    @AppStorage("deepAnthropicEffort") private var deepAnthropicEffort = "high"
+    @AppStorage("deepOpenAIModel") private var deepOpenAIModel = ""
+    @AppStorage("deepOpenAIEffort") private var deepOpenAIEffort = "high"
+    @AppStorage("deepCompatModel") private var deepCompatModel = ""
+    @AppStorage("deepCompatEffort") private var deepCompatEffort = "high"
+    @AppStorage("deepOllamaModel") private var deepOllamaModel = ""
+    @AppStorage("showAnswerCosts") private var showAnswerCosts = true
 
     @AppStorage("settingsTab") private var settingsTab = "AI setup"
     @State private var connectionStatus = ""
@@ -113,6 +142,7 @@ struct SettingsView: View {
     @State private var ollamaStatus = ""
     @AppStorage("transcriptionBackend") private var transcriptionBackend = "apple"
     @AppStorage("diarizerBackend") private var diarizerBackend = "eend"
+    @AppStorage("customVocabulary") private var customVocabulary = ""
     @AppStorage("systemAudioCaptureDriver") private var captureDriver = "direct"
 
     private var provider: ProviderKind {
@@ -156,9 +186,14 @@ struct SettingsView: View {
                 Picker("Listen with", selection: $transcriptionBackend) {
                     Text("Apple Speech (default)").tag("apple")
                     Text("On-device · speaker labels").tag("fluid")
+                    Text("OpenAI Realtime · cloud answers").tag("realtime")
                 }
-                Text("Both options are free with no speech API account. Changes apply the next time you start Listen. Apple may use its servers when on-device recognition is unavailable; the on-device option never sends audio anywhere.")
+                Text("Changes apply the next time you start Listen. Apple may use its servers when on-device recognition is unavailable; the on-device option never sends audio anywhere.")
                     .font(.caption).foregroundStyle(.secondary)
+                if transcriptionBackend == "realtime" {
+                    Text("Meeting audio streams to OpenAI’s Realtime API, so auto answers come from the model that heard the meeting itself — unaffected by transcription errors. Requires an OpenAI API key: add it under AI setup with the OpenAI provider (the key is shared with OpenAI answers). No speaker labels. OpenAI bills usage (the mini realtime model is roughly $0.30–0.40 per hour). Sessions rotate automatically before the 60-minute limit.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Listen shows the transcript. Auto answer responds to detected questions after a short pause. Apple uses about 1.2 seconds of stable text and 0.9 seconds of quiet audio before sending; your AI provider adds its response time. You can type a question anytime.").font(.caption).foregroundStyle(.secondary)
             }
             if transcriptionBackend == "fluid" {
@@ -170,6 +205,10 @@ struct SettingsView: View {
                     Text("Parakeet streaming transcription (English) and LS-EEND or Sortformer speaker separation run as on-device CoreML models via FluidAudio. Speaker labels are tentative; you can rename them in the transcript. The separation choice applies the next time you start Listen; its model downloads once if needed.")
                         .font(.callout).foregroundStyle(.secondary)
                     Text("First use downloads the models once (a few hundred MB from Hugging Face) while Listen waits with progress. After that, everything works offline.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    TextField("Names & jargon", text: $customVocabulary, axis: .vertical)
+                        .lineLimit(3...6)
+                    Text("One term per line. On-device transcription re-checks committed lines against these names, products, and jargon. First use downloads a small extra model; applies the next time you start Listen.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("On-device speech notes") { NSWorkspace.shared.open(LocalSpeechConfiguration.resource("LOCAL_SPEECH_SETUP.md")) }
                 }
@@ -247,6 +286,34 @@ struct SettingsView: View {
                 }
                 Text(provider == .ollama ? "Sends a short test prompt to your configured Ollama server. No API key is required." : "Uses your saved key and sends only a short test prompt. Your provider may charge for this request.").font(.caption).foregroundStyle(.secondary)
                 if !connectionStatus.isEmpty { Text(connectionStatus).font(.callout).textSelection(.enabled) }
+            }
+            WorkspaceSection("Deep work model") {
+                Toggle("Use a different model for wrap-ups and manual questions", isOn: $deepModelEnabled)
+                    .pointingHandCursor()
+                if deepModelEnabled {
+                    switch provider {
+                    case .anthropic:
+                        ModelSetupView(provider: .anthropic, account: "anthropic", model: $deepAnthropicModel, effort: $deepAnthropicEffort).id("deep-anthropic")
+                    case .openAI:
+                        ModelSetupView(provider: .openAI, account: "openai-direct", model: $deepOpenAIModel, effort: $deepOpenAIEffort).id("deep-openai")
+                    case .openAICompatible:
+                        TextField("Deep model ID (blank = answer model)", text: $deepCompatModel)
+                        Picker("Deep reasoning effort", selection: $deepCompatEffort) {
+                            ForEach(SettingsStore.effortLevels, id: \.self) { Text($0).tag($0) }
+                        }
+                        .pointingHandCursor()
+                    case .ollama:
+                        TextField("Deep local model (blank = answer model)", text: $deepOllamaModel)
+                    }
+                    Text("Live auto answers keep the fast model above so they land within seconds. Wrap-ups, Catch me up, and your typed questions use this one — blank model means same model with higher effort. Deep answers may take up to 30 seconds to start.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            WorkspaceSection("Cost & timing") {
+                Toggle("Show answer cost & timing", isOn: $showAnswerCosts)
+                    .pointingHandCursor()
+                Text("Assistant answers show the model, token counts, estimated cost, and response time. The meeting's spend total keeps accumulating while this is off. Costs are estimates from public list prices — your provider invoice is authoritative.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             }
             if settingsTab == "Appearance" {

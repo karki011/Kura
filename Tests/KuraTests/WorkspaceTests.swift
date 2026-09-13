@@ -14,6 +14,7 @@ private final class RecordingProvider: LLMProvider, @unchecked Sendable {
     var response = "A useful answer."
     var suspended = false
     var failing = false
+    var usage: LLMUsage?
     var messages: [LLMMessage] { lock.withLock { recorded } }
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
         lock.withLock { recorded = messages; calls += 1 }
@@ -28,6 +29,19 @@ private final class RecordingProvider: LLMProvider, @unchecked Sendable {
                 continuation.onTermination = { @Sendable _ in task.cancel() }
             }
             else if !suspended { continuation.yield(response); continuation.finish() }
+        }
+    }
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
+        guard let usage, let onUsage else { return stream(messages: messages, system: system) }
+        let base = stream(messages: messages, system: system)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await delta in base { continuation.yield(delta) }
+                    onUsage(usage); continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
         }
     }
 }
@@ -56,7 +70,6 @@ struct WorkspaceTests {
             ("localWorkerDrainsFinalAudioIntoQA", { try await suite.localWorkerDrainsFinalAudioIntoQA() }),
             ("providerCatalogAndReasoningPayloads", { try suite.providerCatalogAndReasoningPayloads() }),
             ("speakerCuesDoNotGuessFromParticipantLists", { try suite.speakerCuesDoNotGuessFromParticipantLists() }),
-            ("structuredWrapUpIncludesSource", { try suite.structuredWrapUpIncludesSource() }),
             ("busySendPreservesDraftAndStopFinalizes", { try await suite.busySendPreservesDraftAndStopFinalizes() }),
             ("typedQuestionUsesTranscriptAndAttachments", { try await suite.typedQuestionUsesTranscriptAndAttachments() }),
             ("savedMeetingExportAndSpeakerCorrectionStayScoped", { try await suite.savedMeetingExportAndSpeakerCorrectionStayScoped() }),
@@ -64,7 +77,8 @@ struct WorkspaceTests {
             ("disabledAutoAnswerDoesNotRequest", { try await suite.disabledAutoAnswerDoesNotRequest() }),
             ("savedQuestionUsesItsOwnContext", { try await suite.savedQuestionUsesItsOwnContext() }),
             ("draftRestoresAfterRelaunch", { try await suite.draftRestoresAfterRelaunch() }),
-            ("wrapUpPersistsStructuredTasks", { try await suite.wrapUpPersistsStructuredTasks() }),
+            ("wrapUpNotesPersistAndLegacySeedsOnce", { try await suite.wrapUpNotesPersistAndLegacySeedsOnce() }),
+            ("wrapUpGenerationStreamsNotes", { try await suite.wrapUpGenerationStreamsNotes() }),
             ("continuousUpdatesStillAutosave", { try await suite.continuousUpdatesStillAutosave() }),
             ("captionMatchingRequiresMatchingSpeech", { try suite.captionMatchingRequiresMatchingSpeech() }),
             ("incrementalCommitKeepsLongMonologue", { try suite.incrementalCommitKeepsLongMonologue() }),
@@ -73,7 +87,20 @@ struct WorkspaceTests {
             ("contextImportAndPackActions", { try await suite.contextImportAndPackActions() }),
             ("historySearchFavoriteDeleteAndUndo", { try await suite.historySearchFavoriteDeleteAndUndo() }),
             ("decisionAndFollowUpActions", { try await suite.decisionAndFollowUpActions() }),
-            ("speakerBindingEvidenceAndUndo", { try await suite.speakerBindingEvidenceAndUndo() })
+            ("speakerBindingEvidenceAndUndo", { try await suite.speakerBindingEvidenceAndUndo() }),
+            ("onDeviceCommitReplacesOpenPartialInOrder", { try suite.onDeviceCommitReplacesOpenPartialInOrder() }),
+            ("customVocabularyTermParsing", { try suite.customVocabularyTermParsing() }),
+            ("deepModelSettingsRouteByPurpose", { try await suite.deepModelSettingsRouteByPurpose() }),
+            ("deletingViewedMeetingLandsOnFreshSession", { try await suite.deletingViewedMeetingLandsOnFreshSession() }),
+            ("trashedMeetingStaysGoneAfterRelaunch", { try await suite.trashedMeetingStaysGoneAfterRelaunch() }),
+            ("realtimeSessionPayload", { try suite.realtimeSessionPayload() }),
+            ("realtimeServerEventParsing", { try suite.realtimeServerEventParsing() }),
+            ("realtimeAudioEncodingAndRotation", { try suite.realtimeAudioEncodingAndRotation() }),
+            ("usageParsingPerProvider", { try suite.usageParsingPerProvider() }),
+            ("modelPricingAndCostMath", { try suite.modelPricingAndCostMath() }),
+            ("answerMetaAndSpendRecorded", { try await suite.answerMetaAndSpendRecorded() }),
+            ("wrapUpUsageAddsToSpend", { try await suite.wrapUpUsageAddsToSpend() }),
+            ("answerMetaCodableCompatibility", { try suite.answerMetaCodableCompatibility() })
         ]
         for (name, run) in checks {
             do { try await run(); print("PASS \(name)") }
@@ -120,6 +147,9 @@ struct WorkspaceTests {
         try check(meeting.attachments.isEmpty)
         let roundtrip = try JSONDecoder().decode(Meeting.self, from: JSONEncoder().encode(meeting))
         try check(roundtrip == meeting)
+        // A wrap-up saved before the freeform notes field decodes with empty notes.
+        let withWrapUp = try JSONDecoder().decode(Meeting.self, from: Data("{\"meta\":{\"id\":\"\(id)\",\"title\":\"Legacy\",\"date\":0},\"wrapUp\":{\"summary\":\"Old summary\",\"decisions\":[\"D\"],\"tasks\":[{\"id\":\"\(UUID())\",\"title\":\"T\",\"owner\":\"\",\"deadline\":\"\",\"completed\":false}]}}".utf8))
+        try check(withWrapUp.wrapUp.summary == "Old summary" && withWrapUp.wrapUp.tasks.count == 1 && withWrapUp.wrapUp.notes.isEmpty)
     }
     @MainActor func fullTranscriptSurvivesAndContextIncludesOversizedTail() throws {
         let store = TranscriptStore()
@@ -169,7 +199,7 @@ struct WorkspaceTests {
     func finalizedTranscriptTriggersQA() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         model.session.context = "We plan to launch on Friday."
@@ -207,7 +237,7 @@ struct WorkspaceTests {
     func conversationalTurnAnswersOnceAndAllowsFollowUp() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         let text = "What is two plus two"
@@ -234,7 +264,7 @@ struct WorkspaceTests {
     func busyAutoAnswerKeepsLatestQuestion() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider(); provider.responseDelay = .milliseconds(700)
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         model.question = "Typed question"; model.send()
@@ -250,7 +280,7 @@ struct WorkspaceTests {
     func newerQuestionInterruptsStaleAutoAnswer() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider(); provider.suspended = true
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         model.transcript.appendFinal("What is earth", speaker: "Alex")
@@ -266,7 +296,7 @@ struct WorkspaceTests {
     func pendingAutoAnswerCancelsWhenDisabledOrPaused() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         model.transcript.appendFinal("What is the plan", speaker: "You")
@@ -297,7 +327,7 @@ struct WorkspaceTests {
     func spokenQuestionLLMFallback() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         // Regex-miss phrasing: classifier says yes → classify call + answer call.
@@ -335,7 +365,7 @@ struct WorkspaceTests {
         try Data("fixture".utf8).write(to: root.appendingPathComponent("model.bin"))
         try Data("fixture".utf8).write(to: root.appendingPathComponent("config.yaml"))
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root.appendingPathComponent("meetings"), restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root.appendingPathComponent("meetings"), restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = true; model.alwaysOnActive = true
         let worker = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Fixtures/local_worker_stub.py")
@@ -373,17 +403,10 @@ struct WorkspaceTests {
         try check(SpeakerCueParser.suggestion(in: ["Speaking: Alex"]) == "Alex")
         try check(SpeakerCueParser.suggestion(in: ["Jamie is speaking"]) == "Jamie")
     }
-    func structuredWrapUpIncludesSource() throws {
-        let id = UUID()
-        let json = "{\"summary\":\"Launch plan\",\"decisions\":[\"Ship Friday\"],\"questions\":[],\"tasks\":[{\"title\":\"Send update\",\"owner\":\"Alex\",\"sourceID\":\"\(id)\"}]}"
-        let wrap = try WrapUpGenerator.parse("```json\n" + json + "\n```")
-        try check(wrap.tasks.first?.sourceID == id)
-        try check(wrap.tasks.first?.deadline == "")
-    }
     @MainActor func busySendPreservesDraftAndStopFinalizes() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider(); provider.suspended = true
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.question = "First question"; model.send()
         model.question = "Do not lose this"; model.send()
         try check(model.question == "Do not lose this")
@@ -395,7 +418,7 @@ struct WorkspaceTests {
     @MainActor func typedQuestionUsesTranscriptAndAttachments() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.transcript.appendFinal("The deadline is Friday.", speaker: "Alex")
         model.session.attachments = [ContextAttachment(name: "brief", text: "Customer needs SSO")]
         model.question = "What should I prioritize?"; model.send()
@@ -433,7 +456,7 @@ struct WorkspaceTests {
     func disabledAutoAnswerDoesNotRequest() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         let original = model.autoQA; defer { model.autoQA = original }
         model.autoQA = false; model.alwaysOnActive = true
         model.transcript.updatePartial("What should we do next?", speaker: "Alex")
@@ -445,7 +468,7 @@ struct WorkspaceTests {
     func savedQuestionUsesItsOwnContext() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.session.context = "LIVE SECRET"
         var past = Meeting.empty(); past.context = "PAST BACKGROUND"
         past.lines = [TranscriptLine(speaker: "Jamie", text: "PAST CONVERSATION")]
@@ -471,21 +494,58 @@ struct WorkspaceTests {
         try check(restored.session.attachments.first?.text == "Remember this")
         try await restored.flush()
     }
-    func wrapUpPersistsStructuredTasks() async throws {
+    func wrapUpNotesPersistAndLegacySeedsOnce() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        provider.response = #"{"summary":"We agreed on a launch.","decisions":["Launch Friday"],"questions":[],"tasks":[{"title":"Send brief","owner":"Alex"}]}"#
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        provider.response = "## Summary\n\nLaunch agreed for Friday."
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.transcript.appendFinal("Launch Friday. Alex will send the brief.", speaker: "You")
-        model.session.wrapUp.tasks = [ActionItem(title: "Check onboarding", completed: true)]
-        model.session.wrapUp.decisions = ["User-confirmed decision"]
         model.generateWrapUp()
         for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
         try check(model.lastError.isEmpty)
-        try check(model.session.wrapUp.tasks.count == 2)
-        try check(model.session.wrapUp.tasks.contains { $0.completed })
-        try check(model.session.wrapUp.decisions.contains("User-confirmed decision"))
+        try check(model.session.wrapUp.notes == provider.response)
         try check(model.meetings.meetings.count == 1)
+        try await model.flush()
+        let draft = try await model.meetings.repository.draft()
+        try check(draft?.wrapUp.notes == provider.response)
+        // Legacy structured content seeds into notes once, then never overwrites edits.
+        model.session.wrapUp = MeetingWrapUp()
+        model.session.wrapUp.summary = "Legacy summary"
+        model.session.wrapUp.decisions = ["Legacy decision"]
+        model.session.wrapUp.tasks = [ActionItem(title: "Send proposal", owner: "Alex", deadline: "Friday", completed: true)]
+        model.session.wrapUp.followUp = "Legacy follow-up"
+        model.seedWrapUpNotesIfNeeded()
+        let seeded = model.session.wrapUp.notes
+        try check(seeded.contains("## Summary") && seeded.contains("Legacy summary"))
+        try check(seeded.contains("## Decisions") && seeded.contains("- Legacy decision"))
+        try check(seeded.contains("- [x] Send proposal — Alex (Friday)"))
+        try check(seeded.contains("## Follow-up draft") && seeded.contains("Legacy follow-up"))
+        model.session.wrapUp.notes = "My edits"
+        model.seedWrapUpNotesIfNeeded()
+        try check(model.session.wrapUp.notes == "My edits")
+        try await model.flush()
+    }
+    @MainActor func wrapUpGenerationStreamsNotes() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["provider", "deepModelEnabled", "anthropicModel", "deepAnthropicModel"]
+        let saved = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
+        defer { for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        defaults.set("Anthropic", forKey: "provider")
+        defaults.set(false, forKey: "deepModelEnabled")
+        defaults.set("claude-sonnet-4-5", forKey: "anthropicModel")
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        provider.response = "## Summary\n\nStreamed wrap-up text."
+        provider.usage = LLMUsage(inputTokens: 1000, outputTokens: 100)
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
+        model.transcript.appendFinal("Launch Friday.", speaker: "Alex")
+        model.generateWrapUp()
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        try check(model.status == .idle && model.lastError.isEmpty)
+        try check(model.tab == .wrapUp)
+        try check(model.session.wrapUp.notes == provider.response)
+        try check(provider.messages.first?.content.contains("Launch Friday.") == true)
+        try check(abs(model.session.aiSpendUSD - 0.0045) < 0.000001)
         try await model.flush()
     }
     func continuousUpdatesStillAutosave() async throws {
@@ -508,7 +568,7 @@ struct WorkspaceTests {
     func retryRecoversFailedAnswer() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider(); provider.failing = true
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.question = "Explain the next step"; model.send()
         for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
         try check(model.canRetry && !model.lastError.isEmpty)
@@ -613,15 +673,185 @@ struct WorkspaceTests {
         try check(model.transcript.lines.last?.speaker == "Alex")
         try await model.flush()
     }
+    @MainActor func onDeviceCommitReplacesOpenPartialInOrder() throws {
+        let store = TranscriptStore()
+        store.updatePartial("Hello ever", speaker: "Unknown speaker")
+        store.discardOpenSpeechPartials()
+        store.appendFinal("Hello everyone", speaker: "Speaker 1")
+        store.updatePartial("Thanks for", speaker: "Unknown speaker")
+        store.discardOpenSpeechPartials()
+        store.appendFinal("Thanks for joining", speaker: "Speaker 2")
+        store.updatePartial("Back to you", speaker: "Unknown speaker")
+        store.discardOpenSpeechPartials()
+        store.appendFinal("Back to the roadmap", speaker: "Speaker 1")
+        // Each utterance is its own bubble in conversation order — no stale
+        // partial bubble left behind rewriting old speech mid-transcript.
+        try check(store.lines.map(\.speaker) == ["Speaker 1", "Speaker 2", "Speaker 1"])
+        try check(store.lines.map(\.text) == ["Hello everyone", "Thanks for joining", "Back to the roadmap"])
+        try check(store.lines.allSatisfy(\.isFinal))
+        // The mic speaker's open partial belongs to a different recognizer and survives.
+        store.updatePartial("My own thought", speaker: "You")
+        store.discardOpenSpeechPartials()
+        store.appendFinal("Next point", speaker: "Speaker 1")
+        try check(store.lines.contains { $0.speaker == "You" && !$0.isFinal })
+        try check(store.lines.last?.text == "Next point")
+    }
+    func customVocabularyTermParsing() throws {
+        try check(CustomVocabulary.parseTerms("") == [])
+        try check(CustomVocabulary.parseTerms("  \n , \n") == [])
+        try check(CustomVocabulary.parseTerms("Kura, Parakeet\nSubash Karki") == ["Kura", "Parakeet", "Subash Karki"])
+        try check(CustomVocabulary.parseTerms("kura\nKURA, Kura ,") == ["kura"])
+        try check(CustomVocabulary.parseTerms(" LS-EEND ,,\nFluidAudio\t") == ["LS-EEND", "FluidAudio"])
+    }
+    @MainActor func deepModelSettingsRouteByPurpose() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["provider", "deepModelEnabled", "deepOpenAIModel", "deepOpenAIEffort", "directOpenAIModel", "directOpenAIEffort"]
+        let saved = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
+        defer { for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        defaults.set("OpenAI", forKey: "provider")
+        defaults.set("gpt-answer", forKey: "directOpenAIModel")
+        defaults.set("low", forKey: "directOpenAIEffort")
+        // Deep off: both purposes resolve to the answer model.
+        defaults.set(false, forKey: "deepModelEnabled")
+        try check(SettingsStore.shared.modelConfig(deep: true).model == "gpt-answer")
+        // Deep on without a model override: same model, higher effort.
+        defaults.set(true, forKey: "deepModelEnabled")
+        let raised = SettingsStore.shared.modelConfig(deep: true)
+        try check(raised.model == "gpt-answer" && raised.effort == "high")
+        // Deep on with an override model; live answers still use the fast one.
+        defaults.set("gpt-deep", forKey: "deepOpenAIModel")
+        try check(SettingsStore.shared.modelConfig(deep: true).model == "gpt-deep")
+        try check(SettingsStore.shared.modelConfig(deep: false).model == "gpt-answer")
+
+        // Routing: wrap-up actions use the deep provider; auto answers the fast one.
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        var deepFlags: [Bool] = []
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { deep in deepFlags.append(deep); return provider })
+        model.transcript.appendFinal("We decided to launch on Friday.", speaker: "Speaker 1")
+        model.assist(.recap)
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        try check(deepFlags.last == true)
+        let original = model.autoQA; defer { model.autoQA = original }
+        model.autoQA = true; model.alwaysOnActive = true
+        model.transcript.appendFinal("What is the launch date?", speaker: "Speaker 1")
+        for _ in 0..<200 where deepFlags.count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        try check(deepFlags.last == false)
+        model.alwaysOnActive = false; try await model.flush()
+    }
+    func realtimeSessionPayload() throws {
+        let payload = RealtimeWire.sessionUpdate(instructions: RealtimeWire.sessionInstructions(context: "Goal: ship Friday"))
+        try check(payload["type"] as? String == "session.update")
+        let session = payload["session"] as? [String: Any]
+        try check(session?["type"] as? String == "realtime")
+        try check(session?["output_modalities"] as? [String] == ["text"])
+        try check((session?["instructions"] as? String)?.contains("ship Friday") == true)
+        let audio = session?["audio"] as? [String: Any]
+        let input = audio?["input"] as? [String: Any]
+        let format = input?["format"] as? [String: Any]
+        try check(format?["type"] as? String == "audio/pcm" && format?["rate"] as? Int == 24000)
+        let transcription = input?["transcription"] as? [String: Any]
+        try check((transcription?["model"] as? String)?.isEmpty == false)
+        let turn = input?["turn_detection"] as? [String: Any]
+        try check(turn?["type"] as? String == "semantic_vad")
+        try check(turn?["create_response"] as? Bool == false && turn?["interrupt_response"] as? Bool == false)
+        // Sessions cap at 60 minutes; rotation must trigger earlier.
+        try check(RealtimeWire.rotateAfterSeconds < RealtimeWire.sessionLimitSeconds)
+        let create = RealtimeWire.responseCreate(instructions: RealtimeWire.answerInstructions(question: "When is launch?"))
+        try check(create["type"] as? String == "response.create")
+        let response = create["response"] as? [String: Any]
+        let answerInstructions = response?["instructions"] as? String
+        try check(answerInstructions?.contains("When is launch?") == true)
+        // Anti-hallucination guardrails: answer only from what was said, with an
+        // explicit "wasn't mentioned" escape hatch, and stay brief.
+        try check(answerInstructions?.contains("only what was actually said") == true)
+        try check(answerInstructions?.contains("wasn't mentioned in the meeting") == true)
+        try check(answerInstructions?.contains("never invent") == true)
+        try check(answerInstructions?.contains("sentence or two") == true)
+        // The session-level instructions carry the same constraint plus the copilot prompt.
+        let sessionInstructions = RealtimeWire.sessionInstructions(context: "Goal: ship Friday")
+        try check(sessionInstructions.contains("Never invent a speaker name, decision, owner, or deadline"))
+        try check(sessionInstructions.contains("only from what was actually said"))
+        try check(response?["output_modalities"] as? [String] == ["text"])
+        // Payloads must round-trip through JSONSerialization.
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        try check((try JSONSerialization.jsonObject(with: data) as? [String: Any])?["type"] as? String == "session.update")
+    }
+    func realtimeServerEventParsing() throws {
+        let delta = RealtimeWire.parse(Data(#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"a","delta":"Hello"}"#.utf8))
+        try check(delta == .transcriptDelta(itemID: "a", delta: "Hello"))
+        let done = RealtimeWire.parse(Data(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"a","transcript":"Hello everyone"}"#.utf8))
+        try check(done == .transcriptCompleted("Hello everyone"))
+        let text = RealtimeWire.parse(Data(#"{"type":"response.output_text.delta","delta":"Four"}"#.utf8))
+        try check(text == .textDelta("Four"))
+        let finished = RealtimeWire.parse(Data(#"{"type":"response.done","response":{"status":"completed"}}"#.utf8))
+        try check(finished == .responseDone(status: "completed"))
+        let failure = RealtimeWire.parse(Data(#"{"type":"error","error":{"message":"boom"}}"#.utf8))
+        try check(failure == .error("boom"))
+        try check(RealtimeWire.parse(Data(#"{"type":"rate_limits.updated"}"#.utf8)) == .ignored("rate_limits.updated"))
+        try check(RealtimeWire.parse(Data("not json".utf8)) == .ignored(""))
+    }
+    func realtimeAudioEncodingAndRotation() throws {
+        let base64 = RealtimeWire.pcm16Base64([0, 1, -1, 0.5])
+        try check(Data(base64Encoded: base64) == Data([0x00, 0x00, 0xFF, 0x7F, 0x00, 0x80, 0xFF, 0x3F]))
+        try check(RealtimeWire.pcm16Base64([2, -2]) == RealtimeWire.pcm16Base64([1, -1])) // out-of-range clamps
+        let now = Date()
+        try check(!RealtimeWire.shouldRotate(startedAt: now.addingTimeInterval(-60), now: now))
+        try check(RealtimeWire.shouldRotate(startedAt: now.addingTimeInterval(-RealtimeWire.rotateAfterSeconds - 1), now: now))
+    }
+    @MainActor func deletingViewedMeetingLandsOnFreshSession() async throws {
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = OverlayViewModel(root: root, restore: false)
+        // The live session carries old chat (e.g. restored from a previous launch).
+        model.transcript.appendFinal("Old live chat", speaker: "Speaker 1")
+        try await model.flush()
+        // A separate saved meeting is open in the viewer.
+        var saved = Meeting.empty(); saved.meta.title = "Viewed meeting"; saved.context = "ctx"
+        try await model.meetings.save(saved)
+        model.viewMeeting(saved)
+        for _ in 0..<100 where model.selected == nil { try await Task.sleep(for: .milliseconds(10)) }
+        try check(model.selected?.id == saved.id)
+        model.deleteMeeting(saved)
+        for _ in 0..<200 where !model.transcript.lines.isEmpty || model.lastDeleted == nil { try await Task.sleep(for: .milliseconds(10)) }
+        // Fresh empty meeting on screen — never the old live chat.
+        try check(model.selected == nil)
+        try check(model.transcript.lines.isEmpty)
+        // The deleted meeting left the library; the old live chat is archived, not shown.
+        try check(model.meetings.meetings.allSatisfy { $0.id != saved.id })
+        try check(model.meetings.meetings.contains { $0.lines.contains { $0.text == "Old live chat" } })
+        try await model.flush()
+    }
+    @MainActor func trashedMeetingStaysGoneAfterRelaunch() async throws {
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let model = OverlayViewModel(root: root, restore: false)
+        var meeting = Meeting.empty(); meeting.meta.title = "Doomed"
+        try await model.meetings.save(meeting)
+        model.deleteMeeting(meeting)
+        for _ in 0..<100 where model.lastDeleted == nil { try await Task.sleep(for: .milliseconds(10)) }
+        try check(model.meetings.meetings.allSatisfy { $0.id != meeting.id })
+        // A relaunch (fresh store over the same root) must not resurrect it.
+        let revived = OverlayViewModel(root: root, restore: true)
+        for _ in 0..<100 where revived.restoring { try await Task.sleep(for: .milliseconds(10)) }
+        try check(revived.meetings.meetings.allSatisfy { $0.id != meeting.id })
+        // The file is kept in Kura's Trash for Undo — gone from the library, not shredded.
+        try check(FileManager.default.fileExists(atPath: root.appendingPathComponent("Trash/\(meeting.id.uuidString).json").path))
+    }
     func decisionAndFollowUpActions() async throws {
         let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let provider = RecordingProvider()
-        let model = OverlayViewModel(root: root, restore: false, providerFactory: { provider })
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
         model.question = "Launch Friday"; model.captureDecision()
-        try check(model.current.wrapUp.decisions == ["Launch Friday"] && model.question.isEmpty)
+        try check(model.current.wrapUp.notes.contains("## Decisions") && model.current.wrapUp.notes.contains("- Launch Friday"))
+        try check(model.current.lines.contains { $0.source == "decision" && $0.text == "Launch Friday" })
+        try check(model.question.isEmpty)
+        // A second decision joins the same section instead of adding a heading.
+        model.question = "Ship the beta Monday"; model.captureDecision()
+        try check(model.current.wrapUp.notes.contains("- Launch Friday\n- Ship the beta Monday"))
+        try check(model.current.wrapUp.notes.components(separatedBy: "## Decisions").count == 2)
         model.assist(.followUps)
         for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
-        try check(model.current.wrapUp.followUp == provider.response && model.tab == .wrapUp)
+        try check(model.current.wrapUp.notes.contains("## Follow-up draft") && model.current.wrapUp.notes.contains(provider.response))
+        try check(model.tab == .wrapUp)
         model.assist(.recap)
         for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
         try check(provider.messages.first?.content.contains("Briefly recap") == true)
@@ -629,6 +859,125 @@ struct WorkspaceTests {
         for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
         try check(provider.messages.first?.content.contains("Suggest a useful") == true)
         try await model.flush()
+    }
+    func usageParsingPerProvider() throws {
+        // Anthropic: input on message_start (cache reads reported separately), output on message_delta.
+        let start = AnthropicProvider.usage(from: Data(#"{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30,"output_tokens":1}}}"#.utf8))
+        try check(start == LLMUsage(inputTokens: 120, outputTokens: 0, cachedInputTokens: 30))
+        let delta = AnthropicProvider.usage(from: Data(#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#.utf8))
+        try check(delta == LLMUsage(inputTokens: 0, outputTokens: 42))
+        try check(AnthropicProvider.usage(from: Data(#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#.utf8)) == nil)
+        // OpenAI Responses: cached tokens normalize out of the full-rate input count.
+        let completed = OpenAIResponsesProvider.usage(Data(#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":40}}}}"#.utf8))
+        try check(completed == LLMUsage(inputTokens: 60, outputTokens: 20, cachedInputTokens: 40))
+        try check(OpenAIResponsesProvider.usage(Data(#"{"type":"response.output_text.delta","delta":"Hi"}"#.utf8)) == nil)
+        // OpenAI-compatible chat completions: usage chunk arrives with empty choices.
+        let chat = OpenAICompatibleProvider.usage(from: Data(#"{"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}"#.utf8))
+        try check(chat == LLMUsage(inputTokens: 45, outputTokens: 10, cachedInputTokens: 5))
+        try check(OpenAICompatibleProvider.usage(from: Data(#"{"choices":[{"delta":{"content":"Hi"}}]}"#.utf8)) == nil)
+        // Ollama: eval counts on the final done line.
+        let ollama = OllamaProvider.usage(from: Data(#"{"done":true,"prompt_eval_count":33,"eval_count":12}"#.utf8))
+        try check(ollama == LLMUsage(inputTokens: 33, outputTokens: 12))
+        try check(OllamaProvider.usage(from: Data(#"{"done":false,"message":{"content":"Hi"}}"#.utf8)) == nil)
+        // Realtime: response.done usage with the audio/text split; cached normalizes out of text input.
+        let realtime = RealtimeWire.usage(from: Data(#"{"type":"response.done","response":{"status":"completed","usage":{"total_tokens":500,"input_tokens":400,"output_tokens":100,"input_token_details":{"text_tokens":150,"audio_tokens":250,"cached_tokens":20},"output_token_details":{"text_tokens":100,"audio_tokens":0}}}}"#.utf8))
+        try check(realtime == LLMUsage(inputTokens: 130, outputTokens: 100, cachedInputTokens: 20, audioInputTokens: 250, audioOutputTokens: 0))
+        try check(RealtimeWire.usage(from: Data(#"{"type":"response.done","response":{"status":"failed"}}"#.utf8)) == nil)
+    }
+    func modelPricingAndCostMath() throws {
+        let mini = ModelPricing.pricePerMTok(model: "gpt-5-mini")
+        try check(mini?.input == 0.25 && mini?.output == 2.00 && mini?.cachedInput == 0.025)
+        // Cached math: 600k fresh input + 400k cached + 1M output = 0.15 + 0.01 + 2.00.
+        let cost = ModelPricing.cost(for: LLMUsage(inputTokens: 600_000, outputTokens: 1_000_000, cachedInputTokens: 400_000), model: "gpt-5-mini")
+        try check(abs((cost ?? 0) - 2.16) < 0.0001)
+        // Prefix specificity: gpt-5.5 must outrank gpt-5, claude-opus-4.5 outranks claude-opus-4.
+        try check(ModelPricing.pricePerMTok(model: "gpt-5.5")?.output == 30.00)
+        try check(ModelPricing.pricePerMTok(model: "gpt-5-nano")?.input == 0.05)
+        try check(ModelPricing.pricePerMTok(model: "claude-opus-4.5")?.input == 5.00)
+        try check(ModelPricing.pricePerMTok(model: "claude-opus-4")?.input == 15.00)
+        // Unknown models are unpriced, not guessed.
+        try check(ModelPricing.pricePerMTok(model: "llama3.2") == nil)
+        try check(ModelPricing.cost(for: LLMUsage(inputTokens: 1, outputTokens: 1), model: "llama3.2") == nil)
+        // Realtime audio/text split: 1M text in @0.60 + 1M text out @2.40 + 1M audio in @10 + 1M audio out @20.
+        let realtimeCost = ModelPricing.cost(for: LLMUsage(inputTokens: 1_000_000, outputTokens: 1_000_000, audioInputTokens: 1_000_000, audioOutputTokens: 1_000_000), model: "gpt-realtime-mini")
+        try check(abs((realtimeCost ?? 0) - 33.0) < 0.001)
+        try check(ModelPricing.formatTokenCount(2100) == "2.1k" && ModelPricing.formatTokenCount(380) == "380")
+        try check(ModelPricing.formatUSD(0.0042) == "0.0042" && ModelPricing.formatUSD(0.07) == "0.07")
+    }
+    @MainActor func answerMetaAndSpendRecorded() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["provider", "deepModelEnabled", "anthropicModel", "deepAnthropicModel"]
+        let saved = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
+        defer { for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        defaults.set("Anthropic", forKey: "provider")
+        defaults.set(false, forKey: "deepModelEnabled")
+        defaults.set("claude-sonnet-4-5", forKey: "anthropicModel")
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        provider.usage = LLMUsage(inputTokens: 1000, outputTokens: 100)
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
+        model.question = "Price this answer"; model.send()
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        let line = model.session.lines.last
+        try check(line?.source == "assistant" && line?.isFinal == true)
+        try check(line?.answerMeta?.model == "claude-sonnet-4-5")
+        try check(line?.answerMeta?.inputTokens == 1000 && line?.answerMeta?.outputTokens == 100)
+        // claude-sonnet-4: 1000 in @3.00 + 100 out @15.00 per 1M = $0.0045.
+        try check(abs((line?.answerMeta?.costUSD ?? 0) - 0.0045) < 0.000001)
+        try check(abs(model.session.aiSpendUSD - 0.0045) < 0.000001)
+        try check(line?.answerMeta?.firstTokenSeconds != nil && line?.answerMeta?.totalSeconds != nil)
+        // A provider without usage still completes: tokens/cost absent, timing present, spend untouched.
+        provider.usage = nil
+        model.question = "No usage here"; model.send()
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        let plain = model.session.lines.last
+        try check(plain?.text == provider.response && plain?.answerMeta != nil)
+        try check(plain?.answerMeta?.inputTokens == nil && plain?.answerMeta?.costUSD == nil)
+        try check(plain?.answerMeta?.totalSeconds != nil)
+        try check(abs(model.session.aiSpendUSD - 0.0045) < 0.000001)
+        // The spend total survives persistence.
+        try await model.flush()
+        let savedDraft = try await model.meetings.repository.draft()
+        try check(abs((savedDraft?.aiSpendUSD ?? 0) - 0.0045) < 0.000001)
+    }
+    @MainActor func wrapUpUsageAddsToSpend() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["provider", "deepModelEnabled", "anthropicModel", "deepAnthropicModel"]
+        let saved = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
+        defer { for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        defaults.set("Anthropic", forKey: "provider")
+        defaults.set(false, forKey: "deepModelEnabled")
+        defaults.set("claude-sonnet-4-5", forKey: "anthropicModel")
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        provider.response = "## Summary\n\nLaunch confirmed for Friday."
+        provider.usage = LLMUsage(inputTokens: 1000, outputTokens: 100)
+        let model = OverlayViewModel(root: root, restore: false, providerFactory: { _ in provider })
+        model.transcript.appendFinal("Launch Friday.", speaker: "Alex")
+        model.generateWrapUp()
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        try check(model.lastError.isEmpty)
+        try check(abs(model.session.aiSpendUSD - 0.0045) < 0.000001)
+        try await model.flush()
+    }
+    func answerMetaCodableCompatibility() throws {
+        var line = TranscriptLine(speaker: "Kura", text: "Hi", source: "assistant")
+        line.answerMeta = AnswerMeta(model: "gpt-5-mini", inputTokens: 10, outputTokens: 5, costUSD: 0.001, firstTokenSeconds: 0.4, totalSeconds: 1.2)
+        let roundtrip = try JSONDecoder().decode(TranscriptLine.self, from: JSONEncoder().encode(line))
+        try check(roundtrip == line)
+        // Lines saved before answerMeta existed decode with nil.
+        let old = try JSONDecoder().decode(TranscriptLine.self, from: Data(#"{"speaker":"Kura","text":"Hi","isFinal":true,"source":"assistant"}"#.utf8))
+        try check(old.answerMeta == nil)
+        // Partial metadata (unpriced model: tokens but no cost) round-trips too.
+        var unpriced = TranscriptLine(speaker: "Kura", text: "Hi", source: "assistant")
+        unpriced.answerMeta = AnswerMeta(model: "llama3.2", inputTokens: 33, outputTokens: 12, costUSD: nil, firstTokenSeconds: nil, totalSeconds: 2.0)
+        try check(try JSONDecoder().decode(TranscriptLine.self, from: JSONEncoder().encode(unpriced)) == unpriced)
+        // Meeting.aiSpendUSD round-trips and defaults to 0 for old files.
+        var meeting = Meeting.empty(); meeting.aiSpendUSD = 0.07
+        let restored = try JSONDecoder().decode(Meeting.self, from: JSONEncoder().encode(meeting))
+        try check(restored == meeting && restored.aiSpendUSD == 0.07)
+        let oldMeeting = try JSONDecoder().decode(Meeting.self, from: Data("{\"meta\":{\"id\":\"\(UUID())\",\"title\":\"Old\",\"date\":0}}".utf8))
+        try check(oldMeeting.aiSpendUSD == 0)
     }
 }
 

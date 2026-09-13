@@ -183,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Session Context"
+        window.title = "Meeting Context"
         window.level = .statusBar
         window.sharingType = Config.debug ? .readOnly : .none
         window.isReleasedWhenClosed = false

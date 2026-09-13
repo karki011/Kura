@@ -21,8 +21,46 @@ struct LLMMessage: Sendable {
     let content: String
 }
 
+/// Token counts for one billable call. `inputTokens` is normalized across providers to
+/// EXCLUDE `cachedInputTokens`: OpenAI reports cached tokens inside input_tokens while
+/// Anthropic reports them separately — parsers align both to this convention so pricing
+/// math is uniform. Audio splits are only set by the realtime engine.
+struct LLMUsage: Equatable, Sendable {
+    var inputTokens: Int
+    var outputTokens: Int
+    var cachedInputTokens: Int?
+    var audioInputTokens: Int?
+    var audioOutputTokens: Int?
+    init(inputTokens: Int, outputTokens: Int, cachedInputTokens: Int? = nil, audioInputTokens: Int? = nil, audioOutputTokens: Int? = nil) {
+        self.inputTokens = inputTokens; self.outputTokens = outputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.audioInputTokens = audioInputTokens; self.audioOutputTokens = audioOutputTokens
+    }
+}
+
+/// The usage callback fires from the provider's network task while the consumer reads
+/// the result after the stream ends on the main actor; the lock keeps that handoff safe.
+final class LLMUsageBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: LLMUsage?
+    var usage: LLMUsage? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
 protocol LLMProvider: Sendable {
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error>
+    /// Usage-aware variant. `onUsage` fires at most once per call, after the final text
+    /// delta and before the stream finishes. Providers that cannot report usage use the
+    /// default implementation, which simply never calls it.
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error>
+}
+
+extension LLMProvider {
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
+        stream(messages: messages, system: system)
+    }
 }
 
 enum StreamTiming {
@@ -70,12 +108,15 @@ struct KeychainBackedProvider: LLMProvider {
     let account: String
     let factory: @Sendable (String) -> any LLMProvider
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
+        stream(messages: messages, system: system, onUsage: nil)
+    }
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let key = await Task.detached { Keychain.get(account: account, allowInteraction: true) ?? "" }.value
                     try Task.checkCancellation()
-                    for try await text in factory(key).stream(messages: messages, system: system) {
+                    for try await text in factory(key).stream(messages: messages, system: system, onUsage: onUsage) {
                         try Task.checkCancellation(); continuation.yield(text)
                     }
                     continuation.finish()
@@ -172,7 +213,31 @@ struct AnthropicProvider: LLMProvider {
         return body
     }
 
+    /// Usage arrives split across two events: input tokens (and cache reads) on
+    /// `message_start`, cumulative output tokens on each `message_delta`. Each call
+    /// returns that event's partial; the stream merges them and reports once at the end.
+    static func usage(from payload: Data) -> LLMUsage? {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else { return nil }
+        switch type {
+        case "message_start":
+            guard let usage = (obj["message"] as? [String: Any])?["usage"] as? [String: Any],
+                  let input = usage["input_tokens"] as? Int else { return nil }
+            // Anthropic bills cache reads separately from input_tokens — no normalization needed.
+            return LLMUsage(inputTokens: input, outputTokens: 0, cachedInputTokens: usage["cache_read_input_tokens"] as? Int)
+        case "message_delta":
+            guard let usage = obj["usage"] as? [String: Any], let output = usage["output_tokens"] as? Int else { return nil }
+            return LLMUsage(inputTokens: 0, outputTokens: output)
+        default:
+            return nil
+        }
+    }
+
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
+        stream(messages: messages, system: system, onUsage: nil)
+    }
+
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -183,6 +248,7 @@ struct AnthropicProvider: LLMProvider {
                     request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
                     request.setValue("application/json", forHTTPHeaderField: "content-type")
                     request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(messages: messages, system: system))
+                    var usage: LLMUsage?
                     for try await payload in SSEStream.payloads(for: request) {
                         guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
                         if obj["type"] as? String == "error" { throw LLMError.http(200, String(data: payload, encoding: .utf8) ?? "Streaming error") }
@@ -190,12 +256,20 @@ struct AnthropicProvider: LLMProvider {
                            (obj["delta"] as? [String: Any])?["stop_reason"] as? String == "max_tokens" {
                             throw KuraError.message("Claude reached the output/reasoning budget. Lower effort or increase the token budget in Settings.")
                         }
+                        if let partial = Self.usage(from: payload) {
+                            var merged = usage ?? LLMUsage(inputTokens: 0, outputTokens: 0)
+                            merged.inputTokens += partial.inputTokens
+                            merged.outputTokens = max(merged.outputTokens, partial.outputTokens)
+                            if let cached = partial.cachedInputTokens { merged.cachedInputTokens = cached }
+                            usage = merged
+                        }
                         guard obj["type"] as? String == "content_block_delta",
                               let delta = obj["delta"] as? [String: Any],
                               delta["type"] as? String == "text_delta",
                               let text = delta["text"] as? String else { continue }
                         continuation.yield(text)
                     }
+                    if let usage { onUsage?(usage) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -214,7 +288,22 @@ struct OpenAICompatibleProvider: LLMProvider {
     let model: String
     var effort: String = "minimal"
 
+    /// The final SSE chunk(s) carry a `usage` object when the request asks for it;
+    /// cached tokens are a subset of prompt_tokens, so normalize them out.
+    static func usage(from payload: Data) -> LLMUsage? {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let usage = obj["usage"] as? [String: Any],
+              let prompt = usage["prompt_tokens"] as? Int,
+              let completion = usage["completion_tokens"] as? Int else { return nil }
+        let cached = (usage["prompt_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int
+        return LLMUsage(inputTokens: max(0, prompt - (cached ?? 0)), outputTokens: completion, cachedInputTokens: cached)
+    }
+
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
+        stream(messages: messages, system: system, onUsage: nil)
+    }
+
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -230,6 +319,7 @@ struct OpenAICompatibleProvider: LLMProvider {
                     var body: [String: Any] = [
                         "model": model,
                         "stream": true,
+                        "stream_options": ["include_usage": true],
                         "messages": [["role": "system", "content": system]]
                             + messages.map { ["role": $0.role, "content": $0.content] },
                     ]
@@ -240,15 +330,18 @@ struct OpenAICompatibleProvider: LLMProvider {
                         body["max_completion_tokens"] = 4096
                     }
                     request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    var usage: LLMUsage?
                     for try await payload in SSEStream.payloads(for: request) {
                         guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
                         if obj["error"] != nil { throw LLMError.http(200, String(data: payload, encoding: .utf8) ?? "Streaming error") }
+                        if let parsed = Self.usage(from: payload) { usage = parsed; continue }
                         guard
                               let choices = obj["choices"] as? [[String: Any]],
                               let delta = choices.first?["delta"] as? [String: Any],
                               let text = delta["content"] as? String else { continue }
                         continuation.yield(text)
                     }
+                    if let usage { onUsage?(usage) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -272,7 +365,22 @@ struct OllamaProvider: LLMProvider {
         return trimmed.isEmpty ? "http://127.0.0.1:11434" : trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    /// Ollama's final line (`done: true`) carries the eval counts. Local inference has no
+    /// dollar price, but the token counts are still useful for the per-answer caption.
+    static func usage(from payload: Data) -> LLMUsage? {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              obj["done"] as? Bool == true else { return nil }
+        let input = obj["prompt_eval_count"] as? Int ?? 0
+        let output = obj["eval_count"] as? Int ?? 0
+        guard input > 0 || output > 0 else { return nil }
+        return LLMUsage(inputTokens: input, outputTokens: output)
+    }
+
     func stream(messages: [LLMMessage], system: String) -> AsyncThrowingStream<String, Error> {
+        stream(messages: messages, system: system, onUsage: nil)
+    }
+
+    func stream(messages: [LLMMessage], system: String, onUsage: (@Sendable (LLMUsage) -> Void)?) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -290,15 +398,18 @@ struct OllamaProvider: LLMProvider {
                         "messages": [["role": "system", "content": system]]
                             + messages.map { ["role": $0.role, "content": $0.content] },
                     ])
+                    var usage: LLMUsage?
                     for try await payload in JSONLineStream.payloads(for: request) {
                         guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else { continue }
                         if let error = obj["error"] as? String { throw LLMError.http(200, error) }
+                        if let parsed = Self.usage(from: payload) { usage = parsed }
                         guard
                               let message = obj["message"] as? [String: Any],
                               let text = message["content"] as? String,
                               !text.isEmpty else { continue }
                         continuation.yield(text)
                     }
+                    if let usage { onUsage?(usage) }
                     continuation.finish()
                 } catch {
                     if let urlError = error as? URLError,

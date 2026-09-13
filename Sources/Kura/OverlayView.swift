@@ -8,13 +8,16 @@ enum KuraStyle {
 }
 
 struct KuraChipButtonStyle: ButtonStyle {
+    /// Tinted chips are for primary actions; secondary actions use neutral so
+    /// the accent color keeps its meaning instead of painting every button.
+    var tinted = true
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .medium))
             .padding(.horizontal, 12).padding(.vertical, 7)
-            .background(KuraStyle.accent.opacity(configuration.isPressed ? 0.3 : 0.14), in: Capsule())
-            .overlay(Capsule().stroke(KuraStyle.accent.opacity(0.3), lineWidth: 1))
-            .foregroundStyle(KuraStyle.accent)
+            .background(tinted ? KuraStyle.accent.opacity(configuration.isPressed ? 0.3 : 0.14) : Color.primary.opacity(configuration.isPressed ? 0.14 : 0.06), in: Capsule())
+            .overlay(Capsule().stroke(tinted ? KuraStyle.accent.opacity(0.3) : Color.primary.opacity(0.14), lineWidth: 1))
+            .foregroundStyle(tinted ? KuraStyle.accent : .primary)
             .contentShape(Capsule())
     }
 }
@@ -65,8 +68,8 @@ struct OverlayView: View {
                         ConversationView(lines: viewModel.current.lines, target: $viewModel.scrollTarget,
                                          onEdit: { editingLine = $0 }, onAsk: { viewModel.askMore($0) })
                     }
-                    if !viewModel.compact { assistBar }
-                    WorkspaceAIControls().disabled(viewModel.status == .streaming)
+                    if !viewModel.compact && viewModel.tab != .wrapUp { assistBar }
+                    if viewModel.tab != .wrapUp { WorkspaceAIControls().disabled(viewModel.status == .streaming) }
                     composer
                     feedback
                 }
@@ -86,6 +89,12 @@ struct OverlayView: View {
                 HStack(spacing: 5) {
                     Circle().fill(viewModel.alwaysOnActive ? KuraStyle.accent : Color.secondary).frame(width: 6, height: 6)
                     Text(viewModel.selected != nil ? "Saved meeting · live session kept separately" : viewModel.captureStatus + (viewModel.ownVoiceActive ? " · mic on" : ""))
+                    if let engine = viewModel.current.captureEngine {
+                        Text("·").foregroundStyle(.tertiary)
+                        Label(OverlayViewModel.engineLabel(engine), systemImage: engine == "realtime" ? "cloud" : "laptopcomputer")
+                            .foregroundStyle(engine == "realtime" ? .orange : .secondary)
+                            .help(engine == "realtime" ? "This meeting was captured via OpenAI Realtime — audio went to OpenAI and answers were billed to your API key." : "This meeting was captured on-device.")
+                    }
                     if viewModel.alwaysOnActive {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
                             Text(duration(until: context.date)).monospacedDigit()
@@ -96,7 +105,7 @@ struct OverlayView: View {
             }
             Spacer(minLength: 4)
             if viewModel.selected != nil {
-                Button("Back to live") { viewModel.backToLive() }.controlSize(.small)
+                Button("Back to live") { viewModel.backToLive() }.buttonStyle(KuraChipButtonStyle(tinted: false))
             } else {
                 Button { viewModel.toggleAlwaysOn() } label: {
                     Label(viewModel.alwaysOnActive ? "Pause" : "Listen", systemImage: viewModel.alwaysOnActive ? "pause.fill" : "waveform")
@@ -112,14 +121,25 @@ struct OverlayView: View {
                 Divider()
                 Button("New meeting") { viewModel.startNewSession() }
                 Button("Quit Kura") { NSApp.terminate(nil) }
-            } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().help("More actions")
+            } label: {
+                Image(systemName: "ellipsis")
+                    .rotationEffect(.degrees(90))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 26, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More actions")
         }.padding(16)
     }
     private var contextStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 Button { showContext = true } label: { Label("Add context", systemImage: "plus.circle") }
-                    .buttonStyle(.bordered).controlSize(.small)
+                    .buttonStyle(KuraChipButtonStyle(tinted: false))
                 if !viewModel.current.context.isEmpty { Label("Notes included", systemImage: "note.text").font(.caption).foregroundStyle(.secondary) }
                 ForEach(viewModel.current.attachments) { item in
                     HStack(spacing: 5) {
@@ -218,15 +238,15 @@ struct OverlayView: View {
             }
             if !viewModel.notice.isEmpty {
                 HStack { Text(viewModel.notice).lineLimit(2)
-                    if viewModel.lastDeleted != nil { Button("Undo") { viewModel.undoDelete() } }
-                    else if viewModel.lastAutoBinding != nil { Button("Undo") { viewModel.undoAutoBinding() } }
+                    if viewModel.lastDeleted != nil { Button("Undo") { viewModel.undoDelete() }.buttonStyle(KuraChipButtonStyle(tinted: false)).controlSize(.small) }
+                    else if viewModel.lastAutoBinding != nil { Button("Undo") { viewModel.undoAutoBinding() }.buttonStyle(KuraChipButtonStyle(tinted: false)).controlSize(.small) }
                     Spacer(); Button { viewModel.notice = "" } label: { Image(systemName: "xmark") }.buttonStyle(.plain).accessibilityLabel("Dismiss notice") }.font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Label(viewModel.saveStatus, systemImage: viewModel.saveStatus == "Saved locally" ? "checkmark.shield" : "externaldrive")
                 Spacer()
                 if viewModel.status == .streaming { ProgressView().controlSize(.mini); Text(viewModel.progress.isEmpty ? "Kura is thinking…" : viewModel.progress) }
-                else { Text("⌘↩ send · ⌃⌥Space hide") }
+                else { Text(viewModel.current.aiSpendUSD > 0 ? "AI spend $\(ModelPricing.formatUSD(viewModel.current.aiSpendUSD)) · ⌘↩ send · ⌃⌥Space hide" : "⌘↩ send · ⌃⌥Space hide") }
             }.font(.system(size: 10)).foregroundStyle(.secondary)
         }.padding(.horizontal, 16).padding(.vertical, 10)
     }
@@ -311,11 +331,23 @@ private struct TranscriptRow: View, Equatable {
     let line: TranscriptLine
     var onEdit: () -> Void
     var onAsk: () -> Void
+    @AppStorage("showAnswerCosts") private var showAnswerCosts = true
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.line == rhs.line }
     // Legacy sessions can hold pathological mega-lines (tens of KB from the
     // EOU-latching era); rendering them whole melts the SwiftUI graph.
     private var displayText: String {
         line.text.count > 4000 ? String(line.text.prefix(4000)) + "\n… (very long passage — Copy gets the full text)" : line.text
+    }
+    private var metaCaption: String? {
+        guard showAnswerCosts, line.source == "assistant", line.isFinal, let meta = line.answerMeta else { return nil }
+        var parts = [meta.model]
+        if let input = meta.inputTokens, let output = meta.outputTokens {
+            parts.append("\(ModelPricing.formatTokenCount(input)) in · \(ModelPricing.formatTokenCount(output)) out")
+        }
+        if let cost = meta.costUSD { parts.append("$\(ModelPricing.formatUSD(cost))") }
+        if let first = meta.firstTokenSeconds { parts.append(String(format: "first token %.1fs", first)) }
+        if let total = meta.totalSeconds { parts.append(String(format: "%.1fs", total)) }
+        return parts.joined(separator: " · ")
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -332,6 +364,7 @@ private struct TranscriptRow: View, Equatable {
             if line.source == "assistant" {
                 if line.isFinal { MarkdownText(text: displayText, fontSize: 14) }
                 else { Text(displayText.isEmpty ? "Thinking…" : displayText).font(.system(size: 14)).foregroundStyle(.secondary) }
+                if let caption = metaCaption { Text(caption).font(.caption2).foregroundStyle(.secondary) }
             } else { Text(displayText).font(.system(size: 14)).foregroundStyle(line.isFinal ? .primary : .secondary) }
         }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
             .padding(line.source == "assistant" ? 12 : 0)
@@ -342,64 +375,88 @@ private struct TranscriptRow: View, Equatable {
 
 struct WrapUpView: View {
     @ObservedObject var model: OverlayViewModel
-    private func binding<T>(_ key: WritableKeyPath<MeetingWrapUp, T>) -> Binding<T> { Binding(get: { model.current.wrapUp[keyPath: key] }, set: { value in model.editCurrent { $0.wrapUp[keyPath: key] = value } }) }
+    @State private var editing = false
+    private var notes: Binding<String> {
+        Binding(get: { model.current.wrapUp.notes }, set: { value in model.editCurrent { $0.wrapUp.notes = value } })
+    }
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    VStack(alignment: .leading) { Text("Make the next step easy.").font(.system(size: 21, weight: .semibold, design: .rounded)); Text("Review and edit before sharing.").font(.caption).foregroundStyle(.secondary) }
-                    Spacer()
-                    Button("Generate", systemImage: "sparkles") { model.generateWrapUp() }.disabled(model.status == .streaming)
-                }
-                if !model.progress.isEmpty { ProgressView(model.progress).font(.caption) }
-                WorkspaceSection("Summary") { TextField("Generate a wrap-up or write your own summary…", text: binding(\.summary), axis: .vertical).lineLimit(3...10).textFieldStyle(.plain).padding(6).frame(maxWidth: .infinity, alignment: .leading) }
-                WorkspaceSection("Decisions") {
-                    TextField("One confirmed decision per line", text: Binding(get: { model.current.wrapUp.decisions.joined(separator: "\n") }, set: { value in model.editCurrent { $0.wrapUp.decisions = value.components(separatedBy: .newlines) } }), axis: .vertical)
-                        .lineLimit(2...12).textFieldStyle(.plain).padding(6).frame(maxWidth: .infinity, alignment: .leading)
-                }
-                WorkspaceSection("Action items · \(model.current.wrapUp.tasks.filter(\.completed).count)/\(model.current.wrapUp.tasks.count) done") {
-                    VStack(spacing: 12) {
-                        ForEach(model.current.wrapUp.tasks) { task in TaskEditor(model: model, item: task) }
-                        Button("Add action item", systemImage: "plus") { model.editCurrent { $0.wrapUp.tasks.append(ActionItem(title: "")) } }.frame(maxWidth: .infinity, alignment: .leading)
-                    }.padding(6)
-                }
-                WorkspaceSection("Open questions") {
-                    TextField("One unresolved question per line", text: Binding(get: { model.current.wrapUp.questions.joined(separator: "\n") }, set: { value in model.editCurrent { $0.wrapUp.questions = value.components(separatedBy: .newlines) } }), axis: .vertical).lineLimit(2...8).textFieldStyle(.plain).padding(6).frame(maxWidth: .infinity, alignment: .leading)
-                }
-                WorkspaceSection("Follow-up draft") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        TextField("A message you can edit and copy…", text: binding(\.followUp), axis: .vertical).lineLimit(3...14).textFieldStyle(.plain)
-                        HStack {
-                            Button("Draft from this meeting") { model.assist(.followUps) }.disabled(model.status == .streaming)
-                            Button("Copy", systemImage: "doc.on.doc") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(model.current.wrapUp.followUp, forType: .string); model.notice = "Follow-up copied" }.disabled(model.current.wrapUp.followUp.isEmpty)
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack {
+                        VStack(alignment: .leading) { Text("Make the next step easy.").font(.system(size: 21, weight: .semibold, design: .rounded)); Text("Review and edit before sharing.").font(.caption).foregroundStyle(.secondary) }
+                        Spacer()
+                        if !model.current.wrapUp.notes.isEmpty {
+                            Button(editing ? "Done" : "Edit", systemImage: editing ? "checkmark" : "pencil") { editing.toggle() }
+                                .buttonStyle(KuraChipButtonStyle(tinted: false))
                         }
-                    }.padding(6)
-                }
-                HStack {
-                    Toggle("Favorite", isOn: Binding(get: { model.current.favorite }, set: { value in model.editCurrent { $0.favorite = value } })).toggleStyle(.checkbox)
-                    TextField("Tags, separated by commas", text: Binding(get: { model.current.tags }, set: { value in model.editCurrent { $0.tags = value } })).textFieldStyle(.roundedBorder)
-                    Button("Export…") { model.exportMeeting() }
-                }
-            }.padding(18)
-        }
-    }
-}
-private struct TaskEditor: View {
-    @ObservedObject var model: OverlayViewModel
-    let item: ActionItem
-    private func value<T>(_ key: WritableKeyPath<ActionItem, T>) -> Binding<T> {
-        Binding(get: { (model.current.wrapUp.tasks.first { $0.id == item.id } ?? item)[keyPath: key] }, set: { value in model.editCurrent { if let i = $0.wrapUp.tasks.firstIndex(where: { $0.id == item.id }) { $0.wrapUp.tasks[i][keyPath: key] = value } } })
-    }
-    var body: some View {
-        HStack(alignment: .top) {
-            Toggle("Complete task", isOn: value(\.completed)).labelsHidden().toggleStyle(.checkbox)
-            VStack(alignment: .leading, spacing: 6) {
-                TextField("What needs to happen?", text: value(\.title)).textFieldStyle(.plain).strikethrough(item.completed)
-                HStack { TextField("Owner", text: value(\.owner)); TextField("Deadline", text: value(\.deadline)) }.textFieldStyle(.roundedBorder).font(.caption)
-                if let id = item.sourceID { Button("View supporting passage") { model.tab = .transcript; model.scrollTarget = id }.buttonStyle(.link).font(.caption) }
+                        Button("Export…", systemImage: "square.and.arrow.up") { model.exportMeeting() }
+                            .buttonStyle(KuraChipButtonStyle(tinted: false))
+                        Button("Generate", systemImage: "sparkles") { editing = false; model.generateWrapUp() }
+                            .buttonStyle(KuraChipButtonStyle()).disabled(model.status == .streaming)
+                    }
+                    if model.wrapUpFraction >= 0 {
+                        HStack(spacing: 10) {
+                            Image(systemName: "sparkles").foregroundStyle(KuraStyle.accent)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(model.progress.isEmpty ? "Writing your wrap-up…" : model.progress)
+                                    .font(.caption).foregroundStyle(.secondary)
+                                ProgressView(value: model.wrapUpFraction).tint(KuraStyle.accent)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(KuraStyle.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    // The wrap-up reads as one structured document, not a stack of
+                    // form fields; Edit switches to the raw text for changes.
+                    if editing || (model.current.wrapUp.notes.isEmpty && model.status != .streaming) {
+                        WorkspaceSection("Wrap-up") {
+                            TextEditor(text: notes)
+                                .font(.system(size: 14)).scrollContentBackground(.hidden)
+                                .frame(minHeight: 420).padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            MarkdownText(text: model.current.wrapUp.notes, fontSize: 14).textSelection(.enabled)
+                            // A pulsing caret marks where new text will land while the
+                            // wrap-up streams in.
+                            if model.status == .streaming {
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(KuraStyle.accent)
+                                    .frame(width: 20, height: 3)
+                                    .phaseAnimator([0.25, 1.0]) { view, phase in view.opacity(phase) } animation: { _ in .easeInOut(duration: 0.7) }
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }.padding(18)
             }
-            Button { model.editCurrent { $0.wrapUp.tasks.removeAll { $0.id == item.id } } } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Remove task")
+            // Pinned footer — outside the scroll area so it never gets clipped
+            // behind a long document.
+            HStack(spacing: 10) {
+                Button { model.editCurrent { $0.favorite.toggle() } } label: {
+                    Image(systemName: model.current.favorite ? "star.fill" : "star")
+                        .font(.system(size: 14))
+                        .foregroundStyle(model.current.favorite ? .orange : .secondary)
+                        .frame(width: 30, height: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(model.current.favorite ? "Remove from favorites" : "Mark as favorite")
+                HStack(spacing: 7) {
+                    Image(systemName: "tag").font(.system(size: 11)).foregroundStyle(.secondary)
+                    TextField("Tags, separated by commas", text: Binding(get: { model.current.tags }, set: { value in model.editCurrent { $0.tags = value } }))
+                        .textFieldStyle(.plain).font(.system(size: 12))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Color.primary.opacity(0.06), in: Capsule())
+                .overlay(Capsule().stroke(Color.primary.opacity(0.14), lineWidth: 1))
+                .frame(maxWidth: 320)
+                Spacer()
+            }
+            .padding(.horizontal, 18).padding(.vertical, 8)
         }
+        .onAppear { model.seedWrapUpNotesIfNeeded() }
     }
 }
 private struct TranscriptEditor: View {

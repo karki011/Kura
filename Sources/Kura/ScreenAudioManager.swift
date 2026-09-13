@@ -26,6 +26,9 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     var onError: (@MainActor (String) -> Void)?
     var onSpeakerTranscript: (@MainActor (SpeakerSegment) -> Void)?
     var onLevel: (@MainActor (Double) -> Void)?
+    /// Supplies meeting context (background + rolling transcript tail) for realtime
+    /// session instructions; re-queried on each session rotation. Set before start.
+    var realtimeContext: (@Sendable () async -> String)?
     private var engine: TranscriptionEngine = .apple
     private var lastLevelTime = Date.distantPast
 
@@ -76,15 +79,16 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
     }
 
     func stopAndDrain() async {
-        let wasFluid: Bool = await withCheckedContinuation { continuation in
+        let stopped: TranscriptionEngine = await withCheckedContinuation { continuation in
             queue.async { [self] in
-                let wasFluid = engine == .fluid
+                let current = engine
                 teardownLocked(drainFluid: false)
-                continuation.resume(returning: wasFluid)
+                continuation.resume(returning: current)
             }
         }
         // Awaited so the final utterance lands before the caller closes open lines.
-        if wasFluid { await FluidSpeechEngine.shared.finishSession() }
+        if stopped == .fluid { await FluidSpeechEngine.shared.finishSession() }
+        else if stopped == .realtime { await RealtimeSpeechEngine.shared.finishSession() }
     }
 
     private func setupCaptureLocked() {
@@ -199,6 +203,11 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
                 startFluidSessionLocked()
                 return
             }
+            if engine == .realtime {
+                CaptureDiagnostics.shared.stage("Waiting for audio · OpenAI Realtime")
+                startRealtimeSessionLocked()
+                return
+            }
             CaptureDiagnostics.shared.stage("Checking Apple speech authorization")
 
             // Recognition starts once speech is authorized; capture already runs.
@@ -288,6 +297,9 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         if engine == .fluid, drainFluid {
             Task { await FluidSpeechEngine.shared.finishSession() }
         }
+        if engine == .realtime, drainFluid {
+            Task { await RealtimeSpeechEngine.shared.finishSession() }
+        }
         running = false
         CaptureDiagnostics.shared.stage("Stopping audio device")
         lifecycle.stop()
@@ -350,6 +362,41 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
                 queue.async { [self] in
                     guard running, lifecycle.acceptsAudio(captureGeneration) else { return }
                     reportError("On-device speech failed to start: \(message)")
+                    teardownLocked()
+                }
+            }
+        }
+    }
+
+    // MARK: Cloud engine (OpenAI Realtime)
+
+    /// Realtime needs no speech authorization; its WebSocket session starts once capture
+    /// is up. The OpenAI key is verified by the caller (OverlayViewModel) beforehand.
+    private func startRealtimeSessionLocked() {
+        let segmentCB = onSpeakerTranscript
+        let partialCB = onTranscript
+        let captureGeneration = lifecycle.capture
+        NSLog("[screenaudio] realtime session start requested")
+        Task { [self] in
+            await RealtimeSpeechEngine.shared.setHandlers(
+                onSegment: { segment in Task { @MainActor in segmentCB?(segment) } },
+                onPartial: { text in Task { @MainActor in partialCB?(text, false) } },
+                onError: { message in
+                    Task { [self] in
+                        queue.async { [self] in
+                            guard running, lifecycle.acceptsAudio(captureGeneration) else { return }
+                            reportError(message)
+                        }
+                    }
+                })
+            do {
+                try await RealtimeSpeechEngine.shared.startSession(contextProvider: realtimeContext ?? { "" })
+                CaptureDiagnostics.shared.stage("OpenAI Realtime running")
+            } catch {
+                let message = error.localizedDescription
+                queue.async { [self] in
+                    guard running, lifecycle.acceptsAudio(captureGeneration) else { return }
+                    reportError("OpenAI Realtime failed to start: \(message)")
                     teardownLocked()
                 }
             }
@@ -498,6 +545,9 @@ final class ScreenAudioManager: NSObject, @unchecked Sendable {
         if engine == .fluid {
             let boxed = SendableAudioBuffer(buffer)
             Task { await FluidSpeechEngine.shared.append(boxed) }
+        } else if engine == .realtime {
+            let boxed = SendableAudioBuffer(buffer)
+            Task { await RealtimeSpeechEngine.shared.append(boxed) }
         } else { request?.append(buffer) }
     }
 
