@@ -1,0 +1,20 @@
+.build/
+Kura.app
+Kura Updated.app/
+dist/
+.DS_Store
+
+# Local credentials, signing material, and generated caches never belong in Git.
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.pem
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+__pycache__/
+*.pyc
