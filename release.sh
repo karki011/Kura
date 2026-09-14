@@ -16,7 +16,7 @@ case "${1:---signed}" in
   *) echo "Usage: bash release.sh [--signed|--local]" >&2; exit 1 ;;
 esac
 
-export KURA_VERSION="${KURA_VERSION:-1.0.0}"
+export KURA_VERSION="${KURA_VERSION:-1.0.1}"
 export KURA_BUILD_NUMBER="${KURA_BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
 swift build -c release
 bash check.sh

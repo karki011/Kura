@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${KURA_VERSION:-1.0.0}"
+VERSION="${KURA_VERSION:-1.0.1}"
 APP="${KURA_PACKAGE_APP:-.build/release-app/Kura.app}"
 DIST="dist"
 PKG="$DIST/Kura-$VERSION.pkg"

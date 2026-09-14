@@ -4,6 +4,26 @@ All notable changes to Kura are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-14
+
+### Fixed
+
+- **Installer relocation** — the `.pkg` installer no longer "relocates" the
+  install to a stray `Kura.app` copy elsewhere on disk (e.g. a dev build in
+  the project directory). `productbuild --component` marked the bundle
+  relocatable, so PackageKit upgraded whatever copy it found first and left
+  `/Applications` empty while reporting success. The component is now built
+  with `pkgbuild --component-plist` and `BundleIsRelocatable=false` on every
+  analyzed bundle (app plus nested helpers/frameworks), so installs always
+  land in `/Applications`. The signed app is staged with `ditto` to preserve
+  xattrs and signature metadata.
+
+### Added
+
+- **In-app version tag** — a small capsule badge showing
+  `CFBundleShortVersionString` beside the logo in the main header and in the
+  meeting library sidebar header, so the running version is visible in-app.
+
 ## [1.0.0] - 2026-09-13
 
 First release of Kura — a native macOS meeting copilot that lives in an
@@ -84,4 +104,5 @@ AI provider key.
 - Cost figures are estimates from a bundled price table; provider
   dashboards are the source of truth.
 
+[1.0.1]: https://github.com/karki011/Kura/releases/tag/v1.0.1
 [1.0.0]: https://github.com/karki011/Kura/releases/tag/v1.0.0
