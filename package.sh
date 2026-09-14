@@ -19,19 +19,51 @@ if [ -e "$PKG" ]; then
   mv "$PKG" "$DIST/backups/Kura-$VERSION-$(date +%Y%m%d-%H%M%S)-$$.pkg"
 fi
 
+APP_ID=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Contents/Info.plist")
+
 INSTALLER_IDENTITY="${KURA_INSTALLER_SIGNING_IDENTITY:-}"
 if [ -z "$INSTALLER_IDENTITY" ]; then
   INSTALLER_IDENTITY=$(security find-identity -v | grep '"Developer ID Installer:' | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
 fi
 
+# Stage the app in a root dir so pkgbuild can attach a component plist.
+# BundleIsRelocatable=false stops PackageKit from "relocating" the install
+# to any other Kura.app copy it finds on disk (e.g. dev builds), which
+# otherwise leaves /Applications without the app.
+STAGING=$(mktemp -d)
+trap 'rm -rf "$STAGING"' EXIT
+ROOT="$STAGING/root"
+mkdir -p "$ROOT"
+ditto "$APP" "$ROOT/$(basename "$APP")"
+
+COMPONENTS_PLIST="$STAGING/components.plist"
+pkgbuild --analyze --root "$ROOT" "$COMPONENTS_PLIST"
+# Apply to every analyzed bundle entry, not just the first, so nested
+# bundles (helpers, frameworks, XPC services) stay non-relocatable too.
+i=0
+while /usr/libexec/PlistBuddy -c "Print :$i:BundleIsRelocatable" "$COMPONENTS_PLIST" >/dev/null 2>&1; do
+  /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$COMPONENTS_PLIST"
+  i=$((i + 1))
+done
+
 if [ -n "$INSTALLER_IDENTITY" ]; then
-  productbuild \
+  pkgbuild \
+    --root "$ROOT" \
+    --component-plist "$COMPONENTS_PLIST" \
+    --identifier "$APP_ID" \
+    --version "$VERSION" \
+    --install-location /Applications \
     --sign "$INSTALLER_IDENTITY" \
-    --component "$APP" /Applications \
     "$PKG"
   echo "signed installer with: $INSTALLER_IDENTITY"
 else
-  productbuild --component "$APP" /Applications "$PKG"
+  pkgbuild \
+    --root "$ROOT" \
+    --component-plist "$COMPONENTS_PLIST" \
+    --identifier "$APP_ID" \
+    --version "$VERSION" \
+    --install-location /Applications \
+    "$PKG"
   echo "note: built an unsigned installer; distribution requires a Developer ID Installer certificate."
 fi
 

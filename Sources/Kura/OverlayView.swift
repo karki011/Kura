@@ -79,7 +79,7 @@ struct OverlayView: View {
     }
     private var header: some View {
         HStack(spacing: 12) {
-            if !viewModel.sidebarOpen || viewModel.compact { KuraLogo(size: 28) }
+            if !viewModel.sidebarOpen || viewModel.compact { KuraLogo(size: 28); KuraVersionTag() }
             Button { viewModel.sidebarOpen.toggle() } label: { Image(systemName: "sidebar.left") }
                 .buttonStyle(.plain).help("Show meeting library").accessibilityLabel("Toggle meeting library")
             VStack(alignment: .leading, spacing: 3) {
@@ -252,7 +252,7 @@ struct OverlayView: View {
     }
     private var library: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) { KuraLogo(); Text("Kura").font(.system(size: 22, weight: .bold, design: .rounded)); Spacer() }
+            HStack(spacing: 8) { KuraLogo(); Text("Kura").font(.system(size: 22, weight: .bold, design: .rounded)); KuraVersionTag().padding(.top, 6); Spacer() }
             Button { viewModel.startNewSession() } label: { Label("New meeting", systemImage: "plus").frame(maxWidth: .infinity) }.buttonStyle(.borderedProminent)
             TextField("Search meetings", text: $viewModel.search).textFieldStyle(.roundedBorder)
             Toggle("Favorites", isOn: $viewModel.favoriteOnly).toggleStyle(.checkbox).font(.caption)

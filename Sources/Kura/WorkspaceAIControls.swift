@@ -15,6 +15,20 @@ struct KuraLogo: View {
     }
 }
 
+struct KuraVersionTag: View {
+    private var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    }
+    var body: some View {
+        Text("v\(version)")
+            .font(.system(size: 9, weight: .medium, design: .rounded))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+            .accessibilityLabel("Kura version \(version)")
+    }
+}
+
 struct WorkspaceAIControls: View {
     @AppStorage("provider") private var providerRaw = ProviderKind.anthropic.rawValue
     @AppStorage("anthropicModel") private var claudeModel = "claude-sonnet-4-5"
