@@ -408,8 +408,15 @@ actor RealtimeSpeechEngine {
                 continuation.finish()
             }
         case .error(let message):
-            if let pending = pendingConnect { pending.resume(.failure(KuraError.message(message))) }
-            else { NSLog("[realtime] server error: %@", message) }
+            if let pending = pendingConnect {
+                pending.resume(.failure(KuraError.message(message)))
+            } else if let continuation = answerContinuation {
+                answerContinuation = nil; answerUsageHandler = nil
+                NSLog("[realtime] server error during answer: %@", message)
+                continuation.finish(throwing: KuraError.message(message))
+            } else {
+                NSLog("[realtime] server error: %@", message)
+            }
         case .ignored:
             break
         }
