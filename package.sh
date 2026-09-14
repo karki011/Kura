@@ -34,11 +34,17 @@ STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 ROOT="$STAGING/root"
 mkdir -p "$ROOT"
-cp -R "$APP" "$ROOT/"
+ditto "$APP" "$ROOT/$(basename "$APP")"
 
 COMPONENTS_PLIST="$STAGING/components.plist"
 pkgbuild --analyze --root "$ROOT" "$COMPONENTS_PLIST"
-/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$COMPONENTS_PLIST"
+# Apply to every analyzed bundle entry, not just the first, so nested
+# bundles (helpers, frameworks, XPC services) stay non-relocatable too.
+i=0
+while /usr/libexec/PlistBuddy -c "Print :$i:BundleIsRelocatable" "$COMPONENTS_PLIST" >/dev/null 2>&1; do
+  /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$COMPONENTS_PLIST"
+  i=$((i + 1))
+done
 
 if [ -n "$INSTALLER_IDENTITY" ]; then
   pkgbuild \
