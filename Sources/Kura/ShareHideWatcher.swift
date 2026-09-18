@@ -25,10 +25,11 @@ private let browserShareBundleIDs: Set<String> = [
 final class ShareHideWatcher {
     static let shared = ShareHideWatcher()
 
-    /// Order out all visible app windows; returns whether the overlay panel was among them.
+    /// Order out all visible app windows; returns whether anything was hidden.
     var hideWindows: (() -> Bool)?
-    /// Restore windows hidden by an earlier hideWindows call.
-    var restoreWindows: (() -> Void)?
+    /// Restore windows hidden by an earlier hideWindows call. `restorePanel` is false
+    /// when the user deliberately showed the overlay mid-share — it is already up.
+    var restoreWindows: ((_ restorePanel: Bool) -> Void)?
 
     private(set) var sharingActive = false
     private var timer: Timer?
@@ -86,7 +87,7 @@ final class ShareHideWatcher {
             userOverride = false
             hiddenByShare = hideWindows?() ?? false
         } else {
-            if hiddenByShare && !userOverride { restoreWindows?() }
+            if hiddenByShare { restoreWindows?(!userOverride) }
             hiddenByShare = false
             userOverride = false
         }

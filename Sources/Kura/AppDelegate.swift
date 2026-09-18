@@ -98,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let shareWatcher = ShareHideWatcher.shared
         shareWatcher.hideWindows = { [weak self] in self?.hideForShare() ?? false }
-        shareWatcher.restoreWindows = { [weak self] in self?.restoreAfterShare() }
+        shareWatcher.restoreWindows = { [weak self] restorePanel in self?.restoreAfterShare(restorePanel: restorePanel) }
         shareWatcher.start()
 
         // First run (or after a revoked grant): onboard permissions before anything else.
@@ -197,13 +197,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let visible = NSApp.windows.filter { $0.isVisible }
         shareHiddenWindows = visible
         visible.forEach { $0.orderOut(nil) }
-        return visible.contains { $0 === panel }
+        return !visible.isEmpty
     }
 
-    private func restoreAfterShare() {
+    private func restoreAfterShare(restorePanel: Bool) {
         let windows = shareHiddenWindows
         shareHiddenWindows = []
-        if windows.contains(where: { $0 === panel }) { presentOverlay() }
+        if restorePanel, windows.contains(where: { $0 === panel }) { presentOverlay() }
         for window in windows where window !== panel { window.orderFront(nil) }
     }
 
