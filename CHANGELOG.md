@@ -4,6 +4,29 @@ All notable changes to Kura are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-09-18
+
+### Added
+
+- **Hide while screen sharing** — `sharingType = .none` only protects against
+  capture paths that consult the window server; Zoom's "Advanced capture
+  without window filtering" / GPU-accelerated capture reads the composited
+  framebuffer and transmitted the overlay to participants anyway. Kura now
+  watches Zoom/Teams/Webex (and Chrome/Edge/Arc/Brave for Meet) for UI that
+  only exists while presenting ("Stop share", "You are screen sharing",
+  "You're presenting to everyone") and hides every Kura window while a share
+  is live, restoring them when it ends. Listening and transcription keep
+  running while hidden; showing the overlay manually during a share overrides
+  the hiding for the rest of that share. Settings → Screen sharing toggle,
+  default on; disabled in debug/preview builds.
+
+### Fixed
+
+- **Capture guard for every window** — SwiftUI sheets (attachment preview,
+  transcript editor, capture setup) spawn their own windows that defaulted to
+  capturable, leaking into shares even when the main panel was excluded. Every
+  window the app shows is now forced to `sharingType = .none`.
+
 ## [1.0.1] - 2026-09-14
 
 ### Fixed

@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 BINARY=.build/release/Kura
-VERSION="${KURA_VERSION:-1.0.1}"
+VERSION="${KURA_VERSION:-1.0.2}"
 BUILD_NUMBER="${KURA_BUILD_NUMBER:-1}"
 if [ ! -f "$BINARY" ]; then
   echo "release binary not found; run: swift build -c release" >&2
