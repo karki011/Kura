@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var permissionsWindow: NSWindow?
     private var contextWindow: NSWindow?
     private var escapeMonitor: Any?
+    private var shareHiddenWindows: [NSWindow] = []
     private var statusItem: NSStatusItem?
     private var restartRequested = false
     let viewModel = Config.preview ? PreviewFixtures.model() : OverlayViewModel()
@@ -18,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(Config.debug ? .regular : .accessory)
         installHiddenEditMenu()
+        installCaptureGuard()
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "waveform.bubble", accessibilityDescription: "Kura")
         let menu = NSMenu()
@@ -94,6 +96,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         }
 
+        let shareWatcher = ShareHideWatcher.shared
+        shareWatcher.hideWindows = { [weak self] in self?.hideForShare() ?? false }
+        shareWatcher.restoreWindows = { [weak self] in self?.restoreAfterShare() }
+        shareWatcher.start()
+
         // First run (or after a revoked grant): onboard permissions before anything else.
         // Deferred a runloop turn: windows ordered in from didFinishLaunching can
         // stay invisible even though they exist and report as focused.
@@ -116,6 +123,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         NSApp.mainMenu = mainMenu
+    }
+
+    // SwiftUI sheets and any future windows default to capturable (sharingType = .readOnly).
+    // Force every window this app shows to be excluded from screen capture/sharing,
+    // so Kura stays invisible in Zoom/Meet/Teams shares no matter which window appears.
+    private func installCaptureGuard() {
+        guard !Config.debug else { return }
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(hideWindowFromCapture(_:)), name: NSWindow.didUpdateNotification, object: nil)
+        center.addObserver(self, selector: #selector(hideWindowFromCapture(_:)), name: NSWindow.didBecomeKeyNotification, object: nil)
+    }
+
+    @objc private func hideWindowFromCapture(_ note: Notification) {
+        guard !Config.debug, let window = note.object as? NSWindow, window.sharingType != .none else { return }
+        window.sharingType = .none
     }
 
     func openPermissions() {
@@ -158,9 +180,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showOverlay() {
+        ShareHideWatcher.shared.noteManualShow()
+        presentOverlay()
+    }
+
+    private func presentOverlay() {
         if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) { panel.positionTopCenter() }
         panel.makeKeyAndOrderFront(nil)
         NotificationCenter.default.post(name: .kuraFocusInput, object: nil)
+    }
+
+    /// Ordered out without touching listening/capture state — the assistant keeps
+    /// transcribing and answering while invisible during a screen share.
+    @discardableResult
+    private func hideForShare() -> Bool {
+        let visible = NSApp.windows.filter { $0.isVisible }
+        shareHiddenWindows = visible
+        visible.forEach { $0.orderOut(nil) }
+        return visible.contains { $0 === panel }
+    }
+
+    private func restoreAfterShare() {
+        let windows = shareHiddenWindows
+        shareHiddenWindows = []
+        if windows.contains(where: { $0 === panel }) { presentOverlay() }
+        for window in windows where window !== panel { window.orderFront(nil) }
     }
 
     func hideOverlay() {

@@ -133,6 +133,7 @@ struct SettingsView: View {
     @AppStorage("deepCompatEffort") private var deepCompatEffort = "high"
     @AppStorage("deepOllamaModel") private var deepOllamaModel = ""
     @AppStorage("showAnswerCosts") private var showAnswerCosts = true
+    @AppStorage("hideWhileSharing") private var hideWhileSharing = true
 
     @AppStorage("settingsTab") private var settingsTab = "AI setup"
     @State private var connectionStatus = ""
@@ -336,6 +337,11 @@ struct SettingsView: View {
                         .frame(width: 36)
                 }
                 .help("Lower = more see-through, so the overlay blocks less of what's behind it")
+            }
+            WorkspaceSection("Screen sharing") {
+                Toggle("Hide Kura while you share your screen", isOn: $hideWhileSharing)
+                    .pointingHandCursor()
+                    .help("Zoom's GPU-accelerated capture can show windows that opted out of capture. While your meeting app reports an active share, every Kura window is hidden and restored when the share ends.")
             }
             WorkspaceSection("Debugging") {
                 Toggle("Debug mode (visible to screenshots, diagnostics line)", isOn: $debugMode)
