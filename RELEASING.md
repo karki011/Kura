@@ -9,7 +9,7 @@ meetings remain associated with the same app. Keys remain in macOS Keychain.
 
 Run `bash release.sh --local`. This builds the release executable, runs the
 regression checks, bundles `.build/release-app/Kura.app`, verifies its signature,
-and creates `dist/Kura-1.0.0.pkg`. Existing app bundles and installer artifacts
+and creates `dist/Kura-1.1.0.pkg`. Existing app bundles and installer artifacts
 are backed up rather than deleted. The script does not install or launch anything.
 
 The installer targets `/Applications`. Quit existing Kura copies before installing.

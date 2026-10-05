@@ -44,7 +44,7 @@ enum ConversationContext {
     static func recent(_ lines: [TranscriptLine], maxChars: Int = 14000) -> String {
         guard maxChars > 0 else { return "" }
         var remaining = maxChars; var selected: [String] = []
-        for line in lines.reversed() where !line.text.isEmpty {
+        for line in lines.reversed() where !line.text.isEmpty && line.source != "screen-capture" {
             let part = String("\(line.speaker): \(line.text)".suffix(remaining))
             selected.append(part); remaining -= part.count + 1
             if remaining <= 0 { break }

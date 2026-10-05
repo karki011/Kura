@@ -132,6 +132,7 @@ open Kura.app
 | --- | --- |
 | `⌃⌥Space` | Show or hide the overlay |
 | `⌃⌥Return` | Send a question |
+| `⌃⌥C` | Capture selected text or screen context once |
 | Hold `Right ⌥` | Push to talk |
 | `⌃⌥M` | Toggle push-to-talk listening |
 | `⌃⌥L` | Toggle continuous system-audio listening |
@@ -188,3 +189,35 @@ Issues and pull requests are welcome. Please keep changes macOS-native, avoid in
 ## License
 
 Kura is available under the [MIT License](LICENSE).
+
+## Capture screen context
+
+Press **Control–Option–C** while another app is active to capture context once.
+Kura reads highlighted text first, otherwise text under the pointer, and opens
+its panel with a preview. There is no background observation: changing selection,
+moving the pointer, and switching apps do not capture anything until you press
+the shortcut again. Capture does not modify the clipboard or send an AI request.
+
+Accessibility permission is required. If an app exposes no readable text and
+Screen Recording is already granted, that same hotkey falls back to local Apple
+Vision OCR of the window under the pointer. Images are processed in memory;
+the extracted text is added as a visible **Screen capture** entry in the meeting
+conversation, with its source app and capture time. Kura scrolls to the new entry.
+Existing notes, goal, attachments, and transcript are preserved. Captures autosave
+with the meeting and remain available to later questions, automatic answers,
+wrap-ups, and questions about that saved meeting. OCR does not interpret charts
+or images. **Dismiss preview** hides the preview without deleting the entry.
+You can edit a captured entry in the conversation. Switching meetings clears the
+preview; each meeting keeps its own captures.
+
+To build a debug app:
+
+```sh
+swift build
+KURA_BUILD_CONFIGURATION=debug KURA_APP_OUTPUT=.build/debug-app/Kura.app bash bundle.sh
+open .build/debug-app/Kura.app --args --debug
+```
+
+Debug mode opens the workspace without requiring audio onboarding and allows
+normal screenshots for UI testing. Use the same signing identity between builds
+to preserve macOS permission grants.

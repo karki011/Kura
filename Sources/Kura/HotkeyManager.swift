@@ -16,6 +16,7 @@ final class HotkeyManager {
         case toggleAlwaysOn = 5  // ⌃⌥L
         case quit = 6            // ⌃⌥Q
         case endMeeting = 7      // ⌃⌥E
+        case captureScreenContext = 8
     }
 
     var onToggleOverlay: (() -> Void)?
@@ -23,6 +24,7 @@ final class HotkeyManager {
     var onOpenSettings: (() -> Void)?
     var onQuit: (() -> Void)?
     var onEndMeeting: (() -> Void)?
+    var onCaptureScreenContext: (() -> Void)?
 
     private let viewModel: OverlayViewModel
     private weak var panel: OverlayPanel?
@@ -70,11 +72,13 @@ final class HotkeyManager {
             (.toggleAlwaysOn, 37), // L
             (.quit, 12),           // Q
             (.endMeeting, 14),     // E
+            (.captureScreenContext, 8),
         ]
         for (hotKey, keyCode) in bindings {
             let id = EventHotKeyID(signature: Self.signature, id: hotKey.rawValue)
             var ref: EventHotKeyRef?
-            RegisterEventHotKey(keyCode, mods, id, GetApplicationEventTarget(), 0, &ref)
+            let result = RegisterEventHotKey(keyCode, mods, id, GetApplicationEventTarget(), 0, &ref)
+            if hotKey == .captureScreenContext && result != noErr { viewModel.screenContext.shortcutUnavailable() }
             hotKeyRefs.append(ref)
         }
     }
@@ -90,6 +94,7 @@ final class HotkeyManager {
             if panel?.isVisible != true { onToggleOverlay?() }
             viewModel.toggleAlwaysOn()
         case .quit: onQuit?()
+        case .captureScreenContext: onCaptureScreenContext?()
         case .endMeeting:
             if panel?.isVisible != true { onToggleOverlay?() }
             onEndMeeting?()

@@ -103,13 +103,17 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
     }
     var contextForAI: String {
         var result = "Meeting: \(title)\nGoal: \(goal)\nNotes:\n\(context)"
+        for line in lines where line.source == "screen-capture" {
+            result += "\n\n\(line.speaker) [\(line.timestamp.formatted())]:\n\(line.text)"
+        }
         for item in attachments { result += "\n\nAttachment: \(item.name)\n\(item.text)" }
         return String(result.prefix(40000))
     }
-    var contextIsTrimmed: Bool { context.count + goal.count + attachments.reduce(0) { $0 + $1.text.count + $1.name.count + 20 } > 39000 }
+    var contextIsTrimmed: Bool { context.count + goal.count + lines.filter { $0.source == "screen-capture" }.reduce(0) { $0 + $1.text.count + $1.speaker.count + 50 } + attachments.reduce(0) { $0 + $1.text.count + $1.name.count + 20 } > 39000 }
     var markdown: String {
         var text = "# \(title)\n\n\(meta.date.formatted())\n\n"
         if !goal.isEmpty { text += "## Goal\n\(goal)\n\n" }
+        if !context.isEmpty { text += "## Notes\n\(context)\n\n" }
         if !wrapUp.notes.isEmpty { text += "## Wrap-up\n\(wrapUp.notes)\n\n" }
         else { text += wrapUp.legacyMarkdown }
         text += "## Transcript\n\n"

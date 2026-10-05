@@ -4,6 +4,37 @@ All notable changes to Kura are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-04
+
+### Added
+
+- **Capture screen context with Control–Option–C** — capture highlighted text
+  from another app, or readable text under the pointer when no text is selected.
+  With Screen Recording already granted, local OCR is the fallback for windows
+  without accessible text. Capture happens only when the hotkey is pressed.
+- **Visible captures in the meeting conversation** — each capture appears as a
+  timestamped Screen capture entry with its source app. Entries autosave with the
+  meeting, survive relaunch, and remain available for questions, wrap-ups, and
+  Markdown exports. The workspace scrolls to the new entry.
+- **Debug app packaging** — bundle the debug executable for native testing with
+  normal, capturable windows and without mandatory audio onboarding.
+
+### Fixed
+
+- Hotkey capture checks Accessibility permission without requesting it on every
+  press. A missing or stale grant displays a recovery message instead.
+- OpenAI Realtime answers receive the current meeting context, including newly
+  captured entries, rather than relying only on the context at session startup.
+- Markdown exports include the meeting's preparation notes.
+
+### Permissions
+
+- Selected text and pointer content require Accessibility permission. OCR also
+  requires Screen Recording. Moving from an older ad-hoc build may require
+  removing the old Accessibility entry, adding `/Applications/Kura.app`, and
+  restarting Kura. Screen images are processed locally; captured text is sent to
+  the configured AI provider as meeting context when answers are requested.
+
 ## [1.0.2] - 2026-09-18
 
 ### Added

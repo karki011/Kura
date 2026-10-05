@@ -3,17 +3,19 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-BINARY=.build/release/Kura
-VERSION="${KURA_VERSION:-1.0.2}"
+CONFIGURATION="${KURA_BUILD_CONFIGURATION:-release}"
+case "$CONFIGURATION" in debug|release) ;; *) echo "Unsupported build configuration" >&2; exit 1 ;; esac
+BINARY=".build/$CONFIGURATION/Kura"
+VERSION="${KURA_VERSION:-1.1.0}"
 BUILD_NUMBER="${KURA_BUILD_NUMBER:-1}"
 if [ ! -f "$BINARY" ]; then
-  echo "release binary not found; run: swift build -c release" >&2
+  echo "$CONFIGURATION binary not found; run: swift build -c $CONFIGURATION" >&2
   exit 1
 fi
 
 APP="${KURA_APP_OUTPUT:-Kura.app}"
 case "$APP" in
-  Kura.app|"Kura Updated.app"|.build/release-app/Kura.app) ;;
+  Kura.app|"Kura Updated.app"|.build/release-app/Kura.app|.build/debug-app/Kura.app) ;;
   *) echo "Unsupported app output path" >&2; exit 1 ;;
 esac
 if [ -e "$APP" ]; then
