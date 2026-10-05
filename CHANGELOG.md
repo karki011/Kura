@@ -21,6 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A native drag handle provides explicit window movement in full, compact, and
+  icon modes without relying on SwiftUI background hit-testing.
+- AI context reserves space for the newest screen captures and attachments when
+  a meeting exceeds the background limit.
+- Shortcut registration failures remain visible after switching meetings.
 - Hotkey capture checks Accessibility permission without requesting it on every
   press. A missing or stale grant displays a recovery message instead.
 - OpenAI Realtime answers receive the current meeting context, including newly

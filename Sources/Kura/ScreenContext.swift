@@ -31,6 +31,7 @@ final class ScreenContext: ObservableObject {
     @Published private(set) var capturing = false
     private var captureTask: Task<Void, Never>?
     private var captureID = UUID()
+    private var shortcutMissing = false
 
     init(initialSnapshot: ScreenContextSnapshot? = nil) {
         snapshot = initialSnapshot
@@ -108,13 +109,14 @@ final class ScreenContext: ObservableObject {
     func clear() {
         captureID = UUID(); captureTask?.cancel(); captureTask = nil; capturing = false
         snapshot = nil; enabled = false
-        status = "Press Control–Option–C in another app to capture context"
+        status = shortcutMissing ? "Control–Option–C is unavailable; another app may already use this shortcut" : "Press Control–Option–C in another app to capture context"
     }
 
     func stop() { clear() }
 
     func shortcutUnavailable() {
-        status = "Control–Option–C is unavailable; another app may already use this shortcut"
+        shortcutMissing = true
+        clear()
     }
 
     nonisolated static func bounded(_ text: String) -> String {

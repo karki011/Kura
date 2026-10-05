@@ -81,6 +81,7 @@ struct OverlayView: View {
     private var header: some View {
         HStack(spacing: 12) {
             if !viewModel.sidebarOpen || viewModel.compact { KuraLogo(size: 28); KuraVersionTag() }
+            WindowDragHandle().frame(width: 24, height: 28)
             Button { viewModel.sidebarOpen.toggle() } label: { Image(systemName: "sidebar.left") }
                 .buttonStyle(.plain).help("Show meeting library").accessibilityLabel("Toggle meeting library")
             VStack(alignment: .leading, spacing: 3) {

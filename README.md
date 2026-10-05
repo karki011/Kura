@@ -190,6 +190,12 @@ Issues and pull requests are welcome. Please keep changes macOS-native, avoid in
 
 Kura is available under the [MIT License](LICENSE).
 
+## Move the window
+
+Drag the six-dot handle in the workspace header (or beside the icon in icon
+mode) to move Kura. This uses native macOS window dragging independently of
+background dragging through SwiftUI controls.
+
 ## Capture screen context
 
 Press **Control–Option–C** while another app is active to capture context once.

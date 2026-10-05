@@ -92,6 +92,23 @@ struct WorkspaceTests {
         try await restored.flush()
     }
 
+    func latestCaptureRetainsContextBudgetAndShortcutWarning() throws {
+        var meeting = Meeting.empty()
+        meeting.context = String(repeating: "Preparation notes ", count: 3000)
+        meeting.attachments = [ContextAttachment(name: "brief", text: "ATTACHMENT_MARKER")]
+        for index in 0..<5 {
+            meeting.lines.append(TranscriptLine(speaker: "Screen capture · TextEdit", text: "CAPTURE_\(index)_MARKER " + String(repeating: "x", count: 11900), source: "screen-capture"))
+        }
+        let context = meeting.contextForAI
+        try check(context.count <= 40000)
+        try check(context.contains("CAPTURE_4_MARKER") && context.contains("ATTACHMENT_MARKER"))
+        try check(!context.contains("CAPTURE_0_MARKER"))
+        let screen = ScreenContext()
+        screen.shortcutUnavailable()
+        screen.stop()
+        try check(screen.status.contains("unavailable"))
+    }
+
     func screenCaptureNotesBoundUnicode() throws {
         let snapshot = ScreenContextSnapshot(text: "Selection marker", app: "TextEdit", source: "selected text", date: Date())
         try check(snapshot.meetingNote.contains("Selection marker") && snapshot.meetingNote.contains("TextEdit"))
@@ -103,6 +120,7 @@ struct WorkspaceTests {
         var failures = 0
         let checks: [(String, @MainActor () async throws -> Void)] = [
             ("screenCaptureNotesPersistAndStayScoped", { try await suite.screenCaptureNotesPersistAndStayScoped() }),
+            ("latestCaptureRetainsContextBudgetAndShortcutWarning", { try suite.latestCaptureRetainsContextBudgetAndShortcutWarning() }),
             ("screenCaptureNotesBoundUnicode", { try suite.screenCaptureNotesBoundUnicode() }),
             ("captureDiagnosticsTrackStagesWithoutTranscript", { try suite.captureDiagnosticsTrackStagesWithoutTranscript() }),
             ("audioContinuesAcrossRecognitionRestarts", { try suite.audioContinuesAcrossRecognitionRestarts() }),
