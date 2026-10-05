@@ -364,6 +364,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("⌃⌥Space — show/hide overlay")
                     Text("⌃⌥Return — send question")
+                    Text("⌃⌥C — capture selected text or screen context once")
                     Text("Hold Right-⌥ — push-to-talk")
                     Text("⌃⌥M — toggle listening")
                     Text("⌃⌥L — always-on listening (system audio)")

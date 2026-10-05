@@ -70,6 +70,7 @@ struct OverlayView: View {
                     }
                     if !viewModel.compact && viewModel.tab != .wrapUp { assistBar }
                     if viewModel.tab != .wrapUp { WorkspaceAIControls().disabled(viewModel.status == .streaming) }
+                    if viewModel.selected == nil { ScreenContextView(context: viewModel.screenContext) }
                     composer
                     feedback
                 }
@@ -80,6 +81,7 @@ struct OverlayView: View {
     private var header: some View {
         HStack(spacing: 12) {
             if !viewModel.sidebarOpen || viewModel.compact { KuraLogo(size: 28); KuraVersionTag() }
+            WindowDragHandle().frame(width: 24, height: 28)
             Button { viewModel.sidebarOpen.toggle() } label: { Image(systemName: "sidebar.left") }
                 .buttonStyle(.plain).help("Show meeting library").accessibilityLabel("Toggle meeting library")
             VStack(alignment: .leading, spacing: 3) {
@@ -352,7 +354,7 @@ private struct TranscriptRow: View, Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                Image(systemName: line.source == "assistant" ? "sparkle" : line.source == "decision" ? "checkmark.seal" : "person.crop.circle")
+                Image(systemName: line.source == "assistant" ? "sparkle" : line.source == "decision" ? "checkmark.seal" : line.source == "screen-capture" ? "text.viewfinder" : "person.crop.circle")
                     .foregroundStyle(line.source == "assistant" ? KuraStyle.accent : .secondary)
                 Button(line.speaker) { onEdit() }.buttonStyle(.plain).font(.system(size: 12, weight: .semibold)).help("Edit text or correct the speaker")
                 if line.suggestedName != nil { Text("Name suggested").font(.caption2).foregroundStyle(.orange) }
@@ -481,4 +483,26 @@ private struct TranscriptEditor: View {
 extension Notification.Name {
     static let kuraFocusInput = Notification.Name("kuraFocusInput")
     static let kuraOpenSettings = Notification.Name("kuraOpenSettings")
+}
+
+struct ScreenContextView: View {
+    @ObservedObject var context: ScreenContext
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Label("Capture context · ⌃⌥C", systemImage: "text.cursor").font(.caption)
+                if context.snapshot != nil || context.capturing {
+                    Button("Dismiss preview") { context.clear() }.controlSize(.small)
+                }
+                if context.capturing { ProgressView().controlSize(.small) }
+                Spacer()
+            }
+            Text(context.status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            if let snapshot = context.snapshot {
+                Text(snapshot.text).font(.caption).lineLimit(3).textSelection(.enabled)
+                Text("Added to the meeting conversation. Dismissing this preview keeps the saved entry. Screen images stay on this Mac.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }.padding(.horizontal, 16).padding(.vertical, 6)
+    }
 }

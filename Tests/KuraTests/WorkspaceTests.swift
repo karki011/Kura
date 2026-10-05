@@ -49,10 +49,79 @@ private final class RecordingProvider: LLMProvider, @unchecked Sendable {
 @main
 @MainActor
 struct WorkspaceTests {
+    func screenCaptureNotesPersistAndStayScoped() async throws {
+        let root = try temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let provider = RecordingProvider()
+        let capture = ScreenContextSnapshot(text: "SCREEN_SELECTION_42", app: "TextEdit", source: "selected text", date: Date())
+        let context = ScreenContext(initialSnapshot: capture)
+        let model = OverlayViewModel(root: root, restore: false, screenContext: context, providerFactory: { _ in provider })
+        model.session.context = "Existing preparation notes"
+        model.session.goal = "Keep the existing goal"
+        model.session.attachments = [ContextAttachment(name: "brief", text: "Keep the attached brief")]
+        model.transcript.appendFinal("Existing conversation", speaker: "Alex")
+        let meetingID = model.session.id
+        try check(model.addScreenCaptureToMeeting(capture, meetingID: meetingID))
+        try check(model.session.context.contains("Existing preparation notes"))
+        try check(model.session.contextForAI.contains("SCREEN_SELECTION_42") && model.session.contextForAI.contains("TextEdit"))
+        try check(model.session.goal == "Keep the existing goal" && model.session.attachments.count == 1)
+        context.clear()
+        try check(model.session.lines.contains { $0.source == "screen-capture" && $0.text == "SCREEN_SELECTION_42" })
+        try check(model.scrollTarget == model.session.lines.last?.id)
+        try check(provider.callCount == 0)
+        model.question = "Explain this"; model.send()
+        for _ in 0..<100 where model.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        let prompt = provider.messages.first?.content ?? ""
+        try check(prompt.components(separatedBy: "SCREEN_SELECTION_42").count == 2)
+        try check(prompt.contains("Existing preparation notes") && prompt.contains("Existing conversation"))
+        try check(model.exportText().contains("SCREEN_SELECTION_42"))
+        try check(RealtimeWire.answerInstructions(question: "Explain this", context: model.session.contextForAI).contains("SCREEN_SELECTION_42"))
+        try await model.flush()
+        let restored = OverlayViewModel(root: root, providerFactory: { _ in provider })
+        for _ in 0..<100 where restored.restoring { try await Task.sleep(for: .milliseconds(10)) }
+        try check(restored.session.id == meetingID && restored.session.lines.contains { $0.source == "screen-capture" && $0.text == "SCREEN_SELECTION_42" })
+        let saved = restored.session
+        restored.startNewSession()
+        for _ in 0..<100 where restored.transitioning { try await Task.sleep(for: .milliseconds(10)) }
+        try check(restored.session.context.isEmpty)
+        try check(!restored.addScreenCaptureToMeeting(capture, meetingID: meetingID))
+        restored.selected = saved
+        try check(!restored.addScreenCaptureToMeeting(capture, meetingID: restored.session.id))
+        restored.question = "Explain this saved meeting"; restored.send()
+        for _ in 0..<100 where restored.status == .streaming { try await Task.sleep(for: .milliseconds(10)) }
+        try check(provider.messages.first?.content.contains("SCREEN_SELECTION_42") == true)
+        try await restored.flush()
+    }
+
+    func latestCaptureRetainsContextBudgetAndShortcutWarning() throws {
+        var meeting = Meeting.empty()
+        meeting.context = String(repeating: "Preparation notes ", count: 3000)
+        meeting.attachments = [ContextAttachment(name: "brief", text: "ATTACHMENT_MARKER")]
+        for index in 0..<5 {
+            meeting.lines.append(TranscriptLine(speaker: "Screen capture · TextEdit", text: "CAPTURE_\(index)_MARKER " + String(repeating: "x", count: 11900), source: "screen-capture"))
+        }
+        let context = meeting.contextForAI
+        try check(context.count <= 40000)
+        try check(context.contains("CAPTURE_4_MARKER") && context.contains("ATTACHMENT_MARKER"))
+        try check(!context.contains("CAPTURE_0_MARKER"))
+        let screen = ScreenContext()
+        screen.shortcutUnavailable()
+        screen.stop()
+        try check(screen.status.contains("unavailable"))
+    }
+
+    func screenCaptureNotesBoundUnicode() throws {
+        let snapshot = ScreenContextSnapshot(text: "Selection marker", app: "TextEdit", source: "selected text", date: Date())
+        try check(snapshot.meetingNote.contains("Selection marker") && snapshot.meetingNote.contains("TextEdit"))
+        try check(ScreenContext.bounded("  " + String(repeating: "é", count: 13000) + "  ").count == 12000)
+    }
+
     static func main() async throws {
         let suite = WorkspaceTests()
         var failures = 0
         let checks: [(String, @MainActor () async throws -> Void)] = [
+            ("screenCaptureNotesPersistAndStayScoped", { try await suite.screenCaptureNotesPersistAndStayScoped() }),
+            ("latestCaptureRetainsContextBudgetAndShortcutWarning", { try suite.latestCaptureRetainsContextBudgetAndShortcutWarning() }),
+            ("screenCaptureNotesBoundUnicode", { try suite.screenCaptureNotesBoundUnicode() }),
             ("captureDiagnosticsTrackStagesWithoutTranscript", { try suite.captureDiagnosticsTrackStagesWithoutTranscript() }),
             ("audioContinuesAcrossRecognitionRestarts", { try suite.audioContinuesAcrossRecognitionRestarts() }),
             ("oldMeetingMigration", { try suite.oldMeetingMigration() }),

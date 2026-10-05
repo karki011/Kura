@@ -54,6 +54,7 @@ struct IconOverlayView: View {
                 .padding(.leading, 26)
                 .accessibilityLabel("Latest: \(bubbleText)")
             HStack(spacing: 10) {
+                WindowDragHandle().frame(width: 24, height: 28)
                 Button { viewModel.expandFromIcon() } label: {
                     KuraLogo(size: 40)
                         .overlay {

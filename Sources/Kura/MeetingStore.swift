@@ -102,14 +102,32 @@ struct Meeting: Codable, Equatable, Sendable, Identifiable {
         captureEngine = try c.decodeIfPresent(String.self, forKey: .captureEngine)
     }
     var contextForAI: String {
-        var result = "Meeting: \(title)\nGoal: \(goal)\nNotes:\n\(context)"
-        for item in attachments { result += "\n\nAttachment: \(item.name)\n\(item.text)" }
-        return String(result.prefix(40000))
+        let base = "Meeting: \(title)\nGoal: \(goal)\nNotes:\n\(context)"
+        let attached = attachments.map { "Attachment: \($0.name)\n\($0.text)" }.joined(separator: "\n\n")
+        var remaining = 20000
+        var captured: [String] = []
+        for line in lines.reversed() where line.source == "screen-capture" && remaining > 0 {
+            let part = String("\(line.speaker) [\(line.timestamp.formatted())]:\n\(line.text)".prefix(max(0, remaining - 2)))
+            captured.append(part)
+            remaining -= part.count + 2
+        }
+        let captures = captured.reversed().joined(separator: "\n\n")
+        guard !captures.isEmpty else {
+            return String((base + (attached.isEmpty ? "" : "\n\n" + attached)).prefix(40000))
+        }
+        let attachmentReserve = min(attached.count, 10000)
+        let backgroundBudget = max(0, 40000 - captures.count - attachmentReserve - 4)
+        var result = String(base.prefix(backgroundBudget)) + "\n\n" + captures
+        if !attached.isEmpty {
+            result += "\n\n" + String(attached.prefix(max(0, 40000 - result.count - 2)))
+        }
+        return result
     }
-    var contextIsTrimmed: Bool { context.count + goal.count + attachments.reduce(0) { $0 + $1.text.count + $1.name.count + 20 } > 39000 }
+    var contextIsTrimmed: Bool { context.count + goal.count + lines.filter { $0.source == "screen-capture" }.reduce(0) { $0 + $1.text.count + $1.speaker.count + 50 } + attachments.reduce(0) { $0 + $1.text.count + $1.name.count + 20 } > 39000 }
     var markdown: String {
         var text = "# \(title)\n\n\(meta.date.formatted())\n\n"
         if !goal.isEmpty { text += "## Goal\n\(goal)\n\n" }
+        if !context.isEmpty { text += "## Notes\n\(context)\n\n" }
         if !wrapUp.notes.isEmpty { text += "## Wrap-up\n\(wrapUp.notes)\n\n" }
         else { text += wrapUp.legacyMarkdown }
         text += "## Transcript\n\n"

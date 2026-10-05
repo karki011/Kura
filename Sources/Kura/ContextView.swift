@@ -27,7 +27,7 @@ struct ContextView: View {
                     if viewModel.current.attachments.isEmpty { Text("PDFs, Markdown, and plain text · up to 20 MB per file").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
                 }
             }.frame(maxHeight: 110)
-            if viewModel.current.contextIsTrimmed { Text("This meeting exceeds the AI background limit. The first 40,000 characters of goal, notes, and attachments will be included. Remove or shorten material to include later files.").font(.caption).foregroundStyle(.orange) }
+            if viewModel.current.contextIsTrimmed { Text("This meeting exceeds the AI background limit. AI background is limited to 40,000 characters, with recent screen captures prioritized. Shorten notes or attachments to include more material.").font(.caption).foregroundStyle(.orange) }
             Divider()
             HStack {
                 Menu("Use a context pack") { ForEach(viewModel.meetings.packs) { pack in Button(pack.name) { viewModel.applyPack(pack) } } }.disabled(viewModel.meetings.packs.isEmpty)

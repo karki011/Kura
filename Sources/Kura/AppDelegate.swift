@@ -76,6 +76,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeys.onSend = { [weak self] in self?.viewModel.send() }
         hotkeys.onOpenSettings = { [weak self] in self?.openSettings() }
         hotkeys.onQuit = { NSApp.terminate(nil) }
+        hotkeys.onCaptureScreenContext = { [weak self] in
+            guard let self else { return }
+            guard self.viewModel.selected == nil, !self.viewModel.transitioning, !self.viewModel.restoring else {
+                self.viewModel.notice = "Return to the live workspace to capture screen context"
+                self.showOverlay()
+                return
+            }
+            let meetingID = self.viewModel.session.id
+            self.viewModel.screenContext.captureFromHotkey(onCaptured: { [weak self] snapshot in
+                self?.viewModel.addScreenCaptureToMeeting(snapshot, meetingID: meetingID)
+            }, onComplete: { [weak self] in self?.showOverlay() })
+        }
         hotkeys.onEndMeeting = { [weak self] in self?.viewModel.assist(.summarize) }
         if !Config.preview { hotkeys.register() }
         NotificationCenter.default.addObserver(forName: .kuraOpenSettings, object: nil, queue: .main) { [weak self] _ in
@@ -105,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Deferred a runloop turn: windows ordered in from didFinishLaunching can
         // stay invisible even though they exist and report as focused.
         PermissionManager.shared.refresh()
-        if !Config.preview && !PermissionManager.shared.requiredGranted {
+        if !Config.preview && !Config.debug && !PermissionManager.shared.requiredGranted {
             DispatchQueue.main.async { self.openPermissions() }
         } else { showOverlay() }
     }
