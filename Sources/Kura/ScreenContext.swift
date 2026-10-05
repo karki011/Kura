@@ -62,7 +62,7 @@ final class ScreenContext: ObservableObject {
                 if self.captureID == capture { self.capturing = false; onComplete() }
             }
             do {
-                let result = await Task.detached(priority: .utility) { Self.read(target) }.value
+                let result = try await Task.detached(priority: .utility) { try Self.read(target) }.value
                 try Task.checkCancellation()
                 let text: String
                 let source: String
@@ -129,13 +129,15 @@ final class ScreenContext: ObservableObject {
         return value
     }
 
-    nonisolated private static func read(_ target: ScreenContextTarget) -> (String, String)? {
+    nonisolated private static func read(_ target: ScreenContextTarget) throws -> (String, String)? {
         let app = AXUIElementCreateApplication(target.pid)
         AXUIElementSetMessagingTimeout(app, 0.15)
         if let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
             let element = unsafeDowncast(focused, to: AXUIElement.self)
             AXUIElementSetMessagingTimeout(element, 0.15)
-            if attribute(element, kAXSubroleAttribute) as? String == kAXSecureTextFieldSubrole { return nil }
+            if attribute(element, kAXSubroleAttribute) as? String == kAXSecureTextFieldSubrole {
+                throw KuraError.message("Capture is unavailable while a secure text field is focused")
+            }
             if let text = attribute(element, kAXSelectedTextAttribute) as? String, !bounded(text).isEmpty {
                 return (bounded(text), "selected text")
             }
@@ -144,7 +146,9 @@ final class ScreenContext: ObservableObject {
         guard AXUIElementCopyElementAtPosition(app, Float(target.x), Float(target.y), &hit) == .success,
               let hit else { return nil }
         AXUIElementSetMessagingTimeout(hit, 0.15)
-        guard attribute(hit, kAXSubroleAttribute) as? String != kAXSecureTextFieldSubrole else { return nil }
+        guard attribute(hit, kAXSubroleAttribute) as? String != kAXSecureTextFieldSubrole else {
+            throw KuraError.message("Capture is unavailable over a secure text field")
+        }
         let strings = [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute]
             .compactMap { attribute(hit, $0) as? String }.map(bounded).filter { !$0.isEmpty }
         let text = bounded(strings.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }.joined(separator: "\n"))
